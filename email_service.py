@@ -42,6 +42,10 @@ def send_email(to: str, subject: str, html: str, text: Optional[str] = None) -> 
         headers={
             "Authorization": f"Bearer {RESEND_API_KEY}",
             "Content-Type":  "application/json",
+            # Cloudflare in front of api.resend.com rejects the default Python
+            # urllib User-Agent (Cloudflare error 1010). Set a real-looking one.
+            "User-Agent":    "Reelcrate/1.0 (+https://reelcrate.app)",
+            "Accept":        "application/json",
         },
         method="POST",
     )
