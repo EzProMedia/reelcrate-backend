@@ -5,3 +5,6 @@ librosa==0.10.2
 numpy==1.26.4
 scipy==1.13.1
 soundfile==0.12.1
+bcrypt==4.2.0
+PyJWT==2.9.0
+pydantic[email]==2.9.2

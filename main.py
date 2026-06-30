@@ -25,7 +25,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
@@ -33,6 +33,7 @@ from fastapi.responses import FileResponse, JSONResponse
 sys.path.insert(0, str(Path(__file__).parent))
 from analyze import detect_drops, assign_hooks, GENRE_BPM_RANGES  # type: ignore
 from render import render_clip, VISUALIZER_STYLES  # type: ignore
+from auth import router as auth_router, current_user  # type: ignore
 
 
 # -------------------- Configuration --------------------
@@ -60,7 +61,7 @@ ALLOWED_ORIGINS = [
 
 # -------------------- App setup --------------------
 
-app = FastAPI(title="Reelcrate API", version="0.1.0")
+app = FastAPI(title="Reelcrate API", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -68,6 +69,7 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+app.include_router(auth_router)
 
 
 # -------------------- Job state helpers --------------------
@@ -200,6 +202,7 @@ async def upload(
     num_clips: int = Form(DEFAULT_NUM_CLIPS),
     clip_length: int = Form(DEFAULT_CLIP_LENGTH),
     watermark: str = Form("@realdjez1"),
+    user_email: str = Depends(current_user),     # gated: sign-in required
 ):
     if genre not in GENRE_BPM_RANGES:
         raise HTTPException(400, f"unknown genre '{genre}'")
@@ -243,6 +246,7 @@ async def upload(
         "num_clips": num_clips,
         "clip_length": clip_length,
         "started_at": time.time(),
+        "owner_email": user_email,
     }
     write_state(job_id, state)
 
