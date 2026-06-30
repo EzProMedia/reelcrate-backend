@@ -61,7 +61,7 @@ ALLOWED_ORIGINS = [
 
 # -------------------- App setup --------------------
 
-app = FastAPI(title="Reelcrate API", version="0.2.0")
+app = FastAPI(title="Reelcrate API", version="0.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -204,6 +204,15 @@ async def upload(
     watermark: str = Form("@realdjez1"),
     user_email: str = Depends(current_user),     # gated: sign-in required
 ):
+    # Verified-email gate (signup is allowed but upload requires verification).
+    import json as _json
+    from auth import USERS_FILE
+    try:
+        users = _json.loads(USERS_FILE.read_text())
+    except Exception:
+        users = {}
+    if not users.get(user_email, {}).get("verified"):
+        raise HTTPException(403, "Please verify your email before uploading. Check your inbox.")
     if genre not in GENRE_BPM_RANGES:
         raise HTTPException(400, f"unknown genre '{genre}'")
     if visualizer not in VISUALIZER_STYLES:
