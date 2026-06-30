@@ -19,6 +19,12 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 RESEND_URL     = "https://api.resend.com/emails"
 FROM_ADDRESS   = os.environ.get("RESEND_FROM", "Reelcrate <onboarding@resend.dev>")
 APP_URL        = os.environ.get("APP_URL", "https://reelcrate.app").rstrip("/")
+# Where the backend lives — verify links point here so /api/auth/verify can
+# run and then 307 the user back to APP_URL/app/?verified=1.
+BACKEND_URL    = os.environ.get(
+    "BACKEND_URL",
+    "https://reelcrate-backend-production.up.railway.app",
+).rstrip("/")
 
 
 def send_email(to: str, subject: str, html: str, text: Optional[str] = None) -> bool:
@@ -99,7 +105,9 @@ def _btn(label: str, href: str) -> str:
 
 
 def send_verify_email(to: str, name: str, token: str) -> bool:
-    link = f"{APP_URL}/app/?verify={token}"
+    # Link goes to the backend — it marks the account verified, then 307-redirects
+    # the browser to APP_URL/app/?verified=1 which the frontend renders as ✓.
+    link = f"{BACKEND_URL}/api/auth/verify?token={token}"
     title = f"Verify your email to start uploading"
     body = (f'Hey {name or "DJ"} —<br><br>'
             f'Tap the button below to verify {to} and unlock uploads. '
