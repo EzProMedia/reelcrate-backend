@@ -134,6 +134,98 @@ def _bpm_matches_genre(bpm: float, genre: str) -> bool:
     return False
 
 
+def _ffmpeg_predecode(input_path: str, target_sr: int = 11025) -> tuple[str, str]:
+    """
+    Convert any input format to two small mono WAV files: main + bass-filtered.
+    ffmpeg streams the input so we never hold the full source file in memory.
+
+    Returns (main_wav_path, bass_wav_path). Files live in a temp dir next to
+    the input so they get cleaned up with the job.
+    """
+    import subprocess, tempfile
+    src_dir = os.path.dirname(os.path.abspath(input_path)) or tempfile.gettempdir()
+    main_wav = os.path.join(src_dir, "_analyze_main.wav")
+    bass_wav = os.path.join(src_dir, "_analyze_bass.wav")
+
+    # Main: mono, target_sr, 16-bit PCM. Tiny disk footprint (~22 MB per hour).
+    subprocess.run(
+        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+         "-i", input_path,
+         "-ac", "1", "-ar", str(target_sr),
+         "-c:a", "pcm_s16le", main_wav],
+        check=True,
+    )
+    # Bass: low-pass at 250 Hz — used for stable BPM detection on the kick drum.
+    subprocess.run(
+        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+         "-i", main_wav, "-af", "lowpass=f=250",
+         "-c:a", "pcm_s16le", bass_wav],
+        check=True,
+    )
+    return main_wav, bass_wav
+
+
+def _read_wav_window(wav_path: str, start_sec: float, dur_sec: float) -> tuple[np.ndarray, int]:
+    """Read a small window from a WAV file (used for BPM around each peak)."""
+    import soundfile as sf
+    with sf.SoundFile(wav_path) as f:
+        sr = f.samplerate
+        f.seek(max(0, int(start_sec * sr)))
+        y = f.read(int(dur_sec * sr), dtype="float32", always_2d=False)
+    return y, sr
+
+
+def _stream_rms_and_flux(wav_path: str, hop: int = 256, n_fft: int = 1024,
+                         chunk_sec: float = 300.0) -> tuple[np.ndarray, np.ndarray, int, float]:
+    """
+    Stream the WAV in `chunk_sec` chunks, accumulating full-length RMS + spectral
+    flux arrays. Peak memory ~40 MB per chunk regardless of set length.
+
+    Returns (rms, flux, sr, duration_sec).
+    """
+    import soundfile as sf, gc
+
+    rms_parts = []
+    flux_parts = []
+    prev_last_col = None  # carry-over for spectral flux continuity across chunks
+
+    with sf.SoundFile(wav_path) as f:
+        sr = f.samplerate
+        total_frames = f.frames
+        chunk_frames = int(chunk_sec * sr)
+
+        for offset in range(0, total_frames, chunk_frames):
+            f.seek(offset)
+            chunk = f.read(chunk_frames, dtype="float32", always_2d=False)
+            if chunk.size == 0:
+                break
+
+            # RMS on this chunk
+            r = librosa.feature.rms(y=chunk, hop_length=hop)[0]
+            rms_parts.append(r)
+
+            # STFT + spectral flux on this chunk. Prepend previous last column so
+            # the diff between chunks doesn't produce a bogus spike at the seam.
+            S = np.abs(librosa.stft(chunk, hop_length=hop, n_fft=n_fft))
+            if prev_last_col is not None:
+                S = np.hstack([prev_last_col[:, None], S])
+            prev_last_col = S[:, -1].copy()
+            fl = np.maximum(0, np.diff(S, axis=1)).sum(axis=0)
+            flux_parts.append(fl)
+
+            del chunk, S, r, fl
+            gc.collect()
+
+        duration = total_frames / sr
+
+    rms = np.concatenate(rms_parts) if rms_parts else np.zeros(0, dtype=np.float32)
+    flux = np.concatenate(flux_parts) if flux_parts else np.zeros(0, dtype=np.float32)
+    # Match original 'flux' shape (prepend 0 to align with rms length)
+    if flux.size < rms.size:
+        flux = np.concatenate([np.zeros(rms.size - flux.size, dtype=np.float32), flux])
+    return rms, flux, sr, duration
+
+
 def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0,
                  lead_in_sec: float = 6.0, genre: str = "all") -> list[dict]:
     """
@@ -141,42 +233,39 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
       [{start_sec, end_sec, score, peak_sec, energy, flux, bpm, local_bpm, genre_match}, ...]
     sorted by start_sec ascending.
 
-    Strategy:
-      - Energy (RMS) finds loud sections.
-      - Spectral flux spikes find "drop" moments where the mix suddenly changes.
-      - Combine via weighted sum, then pick top-N non-overlapping peaks.
-      - When genre is set, compute local BPM near each peak and filter to peaks
-        whose tempo matches the genre's BPM range (or half/double).
-      - Each clip is positioned so the peak sits at lead_in_sec from clip start
-        (build-up → drop pattern works better for Reels).
+    v2 memory strategy (fits under 512 MB even for 3-hour sets):
+      - ffmpeg pre-decodes to a tiny mono 11025 Hz WAV on disk (no full-file load)
+      - Streaming RMS + spectral flux in 5-minute chunks
+      - BPM windows re-read directly from the WAV (never hold full audio in RAM)
     """
-    # Use 11025 Hz mono — plenty for drop/onset detection, halves memory vs 22050
-    # so we can analyze 2+ hour sets without OOM kills in constrained environments.
-    SR = 11025
-    y, sr = librosa.load(audio_path, sr=SR, mono=True)
-    duration = len(y) / sr
+    import gc
+
+    # Step 1: ffmpeg pre-decode → small on-disk WAV files
+    main_wav, bass_wav = _ffmpeg_predecode(audio_path, target_sr=11025)
+
+    hop = 256
+    n_fft = 1024
+
+    # Step 2: streaming analysis → full-length RMS + flux arrays
+    rms, flux, sr, duration = _stream_rms_and_flux(main_wav, hop=hop, n_fft=n_fft)
+    frame_sec = hop / sr
+
     if duration < clip_len_sec * 2:
         print(f"[warn] track is short ({duration:.1f}s); reducing num_clips")
         num_clips = max(1, min(num_clips, int(duration // clip_len_sec)))
 
-    hop = 256  # half hop preserves time resolution at lower sample rate
-    frame_sec = hop / sr
-
-    # 1) RMS energy
-    rms = librosa.feature.rms(y=y, hop_length=hop)[0]
+    # 1) Smooth RMS over ~2 sec
+    win = max(1, int(2.0 / frame_sec))
     rms_smooth = librosa.util.normalize(
-        np.convolve(rms, np.ones(int(2.0 / frame_sec)) / int(2.0 / frame_sec), mode="same")
+        np.convolve(rms, np.ones(win) / win, mode="same")
     )
 
-    # 2) Spectral flux (sum of positive frame-to-frame magnitude changes)
-    # n_fft=1024 cuts STFT memory in half vs default 2048
-    S = np.abs(librosa.stft(y, hop_length=hop, n_fft=1024))
-    flux = np.maximum(0, np.diff(S, axis=1)).sum(axis=0)
-    flux = np.concatenate([[0], flux])
-    del S  # free memory before next allocations
+    # 2) Smooth flux over ~1 sec
+    win_f = max(1, int(1.0 / frame_sec))
     flux_smooth = librosa.util.normalize(
-        np.convolve(flux, np.ones(int(1.0 / frame_sec)) / int(1.0 / frame_sec), mode="same")
+        np.convolve(flux, np.ones(win_f) / win_f, mode="same")
     )
+    del rms, flux; gc.collect()
 
     # 3) Combined score — drops have both high sustained energy AND a flux spike
     score = 0.55 * rms_smooth + 0.45 * flux_smooth
@@ -215,18 +304,43 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
     peak_scores = score[peaks_idx]
     ranked_candidates = sorted(zip(peaks_idx, peak_scores), key=lambda x: -x[1])[:candidate_pool]
 
-    # 7) Global BPM on bass-filtered signal (used as fallback / metadata)
-    try:
-        y_bass_global = _bass_filter(y, sr)
-        global_bpm, global_conf = _stable_bpm(y_bass_global, sr)
-    except Exception:
-        global_bpm, global_conf = 0.0, 0.0
+    # 7) Global BPM: sample three 30s windows from the bass WAV and pick the
+    # most confident tempo. Cheap (~1 MB per window) and avoids loading the
+    # full bass-filtered audio into memory.
+    def _global_bpm() -> tuple[float, float]:
+        try:
+            probe_offsets = [duration * 0.25, duration * 0.50, duration * 0.75]
+            best_bpm, best_conf = 0.0, 0.0
+            for off in probe_offsets:
+                y_win, wsr = _read_wav_window(bass_wav, max(0.0, off - 15.0), 30.0)
+                if y_win.size < wsr * 5:
+                    continue
+                b, c = _stable_bpm(y_win, wsr)
+                if c > best_conf:
+                    best_bpm, best_conf = b, c
+                del y_win; gc.collect()
+            return best_bpm, best_conf
+        except Exception:
+            return 0.0, 0.0
 
-    # 8) Compute local BPM around each candidate peak; apply genre filter
+    global_bpm, global_conf = _global_bpm()
+
+    # 8) Compute local BPM around each candidate peak (window read directly
+    # from the bass WAV — never holds the full track in RAM).
+    def _local_bpm_streamed(peak_sec: float, window_sec: float = 15.0) -> tuple[float, float]:
+        start = max(0.0, peak_sec - window_sec / 2)
+        y_win, wsr = _read_wav_window(bass_wav, start, window_sec)
+        if y_win.size < wsr * 2:
+            return 0.0, 0.0
+        try:
+            return _stable_bpm(y_win, wsr)
+        finally:
+            del y_win; gc.collect()
+
     candidates_with_meta = []
     for frame, sc in ranked_candidates:
         peak_sec = float(frame * frame_sec)
-        local_bpm, local_conf = _local_bpm(y, sr, peak_sec)
+        local_bpm, local_conf = _local_bpm_streamed(peak_sec)
         if local_bpm == 0.0:
             local_bpm, local_conf = global_bpm, global_conf
         matches = _bpm_matches_genre(local_bpm, genre)
@@ -254,6 +368,11 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
     # Take top-N from filtered, then re-sort to time order
     selected = sorted(filtered, key=lambda c: -c["score"])[:num_clips]
     selected.sort(key=lambda c: c["frame"])
+
+    # Clean up the temporary pre-decoded WAV files (best-effort)
+    for tmp in (main_wav, bass_wav):
+        try: os.remove(tmp)
+        except Exception: pass
 
     # 10) Build clip segments — center peak with lead_in_sec from clip start
     clips = []
