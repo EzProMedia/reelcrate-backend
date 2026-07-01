@@ -45,7 +45,8 @@ JOBS_DIR = DATA_ROOT / "jobs"
 JOBS_DIR.mkdir(exist_ok=True)
 
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
-CLIP_TTL_HOURS = 24                          # auto-delete after a day
+CLIP_TTL_HOURS = 6                           # auto-delete after 6 hours (was 24, saves volume space)
+FREE_SPACE_MIN_MB = 500                      # if less than this free, run aggressive cleanup
 DEFAULT_NUM_CLIPS = 5
 DEFAULT_CLIP_LENGTH = 30
 
@@ -62,7 +63,7 @@ ALLOWED_ORIGINS = [
 
 # -------------------- App setup --------------------
 
-app = FastAPI(title="Reelcrate API", version="0.4.0")
+app = FastAPI(title="Reelcrate API", version="0.4.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -108,6 +109,34 @@ def cleanup_old_jobs() -> None:
                 shutil.rmtree(d, ignore_errors=True)
         except Exception:
             continue
+
+
+def _free_mb() -> int:
+    """Free space on the data volume, in MB."""
+    try:
+        s = shutil.disk_usage(str(DATA_ROOT))
+        return int(s.free / 1024 / 1024)
+    except Exception:
+        return 999999
+
+
+def emergency_cleanup() -> None:
+    """When free space is tight, delete oldest jobs first regardless of TTL,
+    until we have at least 2 GB free (enough for a 3-hour set upload + 1 GB slack)."""
+    if _free_mb() >= 2048:
+        return
+    # Sort jobs oldest first
+    try:
+        jobs = sorted(JOBS_DIR.iterdir(),
+                      key=lambda p: p.stat().st_mtime if p.exists() else 0)
+    except Exception:
+        return
+    for d in jobs:
+        if _free_mb() >= 2048:
+            break
+        if d.is_dir():
+            print(f"[cleanup] emergency delete {d.name} (free={_free_mb()} MB)")
+            shutil.rmtree(d, ignore_errors=True)
 
 
 # -------------------- Background processing --------------------
@@ -187,6 +216,18 @@ async def process_job(job_id: str, source_path: Path, genre: str,
         state.update({"status": "failed", "progress": 100,
                       "message": f"Engine error: {type(e).__name__}: {e}"})
         write_state(job_id, state)
+        # On failure, also delete the source so we don't hold onto GB of nothing.
+        try: source_path.unlink()
+        except Exception: pass
+
+    finally:
+        # Source file is huge and we don't need it after render — remove it.
+        # Keep the clip MP4s (they're small and the user needs to download them).
+        try:
+            if source_path.exists():
+                source_path.unlink()
+        except Exception:
+            pass
 
 
 # -------------------- Endpoints --------------------
@@ -226,6 +267,13 @@ async def upload(
     if not (10 <= clip_length <= 90):
         raise HTTPException(400, "clip_length out of range (10-90 sec)")
 
+    # Run cleanup FIRST so we have room. Then check we actually have space.
+    cleanup_old_jobs()
+    emergency_cleanup()
+    free_mb = _free_mb()
+    if free_mb < 800:  # need at least 800 MB free for a modest upload
+        raise HTTPException(507, f"Server disk almost full ({free_mb} MB free) — try again in a few minutes")
+
     # Create job dir; stream the upload to disk so we can handle big files.
     job_id = str(uuid.uuid4())
     out_dir = job_dir(job_id)
@@ -234,17 +282,22 @@ async def upload(
     suffix = Path(file.filename or "set.mp4").suffix or ".mp4"
     source_path = out_dir / f"source{suffix}"
     size = 0
-    with open(source_path, "wb") as f:
-        while True:
-            chunk = await file.read(1024 * 1024)  # 1 MB chunks
-            if not chunk:
-                break
-            size += len(chunk)
-            if size > MAX_UPLOAD_BYTES:
-                f.close()
-                shutil.rmtree(out_dir, ignore_errors=True)
-                raise HTTPException(413, "file too large (max 2 GB)")
-            f.write(chunk)
+    try:
+        with open(source_path, "wb") as f:
+            while True:
+                chunk = await file.read(1024 * 1024)  # 1 MB chunks
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    f.close()
+                    shutil.rmtree(out_dir, ignore_errors=True)
+                    raise HTTPException(413, "file too large (max 2 GB)")
+                f.write(chunk)
+    except OSError as e:
+        # Disk-full or write error — clean up partial file and bail with a clean message.
+        shutil.rmtree(out_dir, ignore_errors=True)
+        raise HTTPException(507, f"Server ran out of storage while receiving your upload: {e}")
 
     # Persist initial state.
     state = {
@@ -303,3 +356,31 @@ async def root():
         "docs": "/docs",
         "health": "/healthz",
     }
+
+
+@app.get("/api/admin/disk")
+async def admin_disk():
+    """Public disk-usage probe so I can tell if the volume is full."""
+    try:
+        s = shutil.disk_usage(str(DATA_ROOT))
+        return {
+            "total_mb": int(s.total / 1024 / 1024),
+            "used_mb":  int(s.used / 1024 / 1024),
+            "free_mb":  int(s.free / 1024 / 1024),
+            "n_jobs":   sum(1 for _ in JOBS_DIR.iterdir() if _.is_dir()),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/admin/cleanup")
+async def admin_cleanup(token: str = ""):
+    """Force cleanup. Gate with the JWT secret so randos can't wipe our data."""
+    from auth import JWT_SECRET
+    if token != JWT_SECRET:
+        raise HTTPException(401, "bad token")
+    before = _free_mb()
+    for d in list(JOBS_DIR.iterdir()):
+        if d.is_dir():
+            shutil.rmtree(d, ignore_errors=True)
+    return {"ok": True, "before_mb": before, "after_mb": _free_mb()}
