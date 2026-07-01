@@ -63,7 +63,7 @@ ALLOWED_ORIGINS = [
 
 # -------------------- App setup --------------------
 
-app = FastAPI(title="Reelcrate API", version="0.4.1")
+app = FastAPI(title="Reelcrate API", version="0.5.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,

@@ -30,10 +30,17 @@ from auth import current_user, _load_users, _save_users
 
 
 STRIPE_SECRET_KEY     = os.environ.get("STRIPE_SECRET_KEY", "")
-STRIPE_PRICE_ID       = os.environ.get("STRIPE_PRICE_ID", "")
+STRIPE_PRICE_ID       = os.environ.get("STRIPE_PRICE_ID", "")        # monthly $19
+STRIPE_PRICE_ID_YEAR  = os.environ.get("STRIPE_PRICE_ID_YEAR", "")   # annual  $190
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 APP_URL               = os.environ.get("APP_URL", "https://reelcrate.app").rstrip("/")
 TRIAL_DAYS            = int(os.environ.get("STRIPE_TRIAL_DAYS", "14"))
+
+# Map plan name → env price id
+_PRICE_BY_PLAN = {
+    "monthly": STRIPE_PRICE_ID,
+    "yearly":  STRIPE_PRICE_ID_YEAR,
+}
 
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
@@ -85,12 +92,18 @@ def _get_or_create_customer(email: str, name: str = "") -> str:
 
 # -------------------- routes --------------------
 
+class CheckoutReq(BaseModel):
+    plan: str = "monthly"   # "monthly" or "yearly"
+
+
 @router.post("/checkout")
-async def checkout(email: str = Depends(current_user)):
+async def checkout(req: CheckoutReq = CheckoutReq(), email: str = Depends(current_user)):
     if not STRIPE_SECRET_KEY:
         raise HTTPException(503, "Billing not configured on the server")
-    if not STRIPE_PRICE_ID:
-        raise HTTPException(503, "Billing price not configured")
+
+    price_id = _PRICE_BY_PLAN.get(req.plan)
+    if not price_id:
+        raise HTTPException(503, f"Plan '{req.plan}' not configured")
 
     users = _load_users()
     u = users.get(email) or {}
@@ -102,10 +115,10 @@ async def checkout(email: str = Depends(current_user)):
     session = stripe.checkout.Session.create(
         mode="subscription",
         customer=customer_id,
-        line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+        line_items=[{"price": price_id, "quantity": 1}],
         subscription_data={
             "trial_period_days": TRIAL_DAYS,
-            "metadata": {"reelcrate_email": email},
+            "metadata": {"reelcrate_email": email, "reelcrate_plan": req.plan},
         },
         allow_promotion_codes=True,
         success_url=f"{APP_URL}/app/?checkout=success&session_id={{CHECKOUT_SESSION_ID}}",
