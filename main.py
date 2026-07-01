@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from analyze import detect_drops, assign_hooks, GENRE_BPM_RANGES  # type: ignore
 from render import render_clip, VISUALIZER_STYLES  # type: ignore
 from auth import router as auth_router, current_user  # type: ignore
+from billing import router as billing_router, is_paying  # type: ignore
 
 
 # -------------------- Configuration --------------------
@@ -61,7 +62,7 @@ ALLOWED_ORIGINS = [
 
 # -------------------- App setup --------------------
 
-app = FastAPI(title="Reelcrate API", version="0.3.0")
+app = FastAPI(title="Reelcrate API", version="0.4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -70,6 +71,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(auth_router)
+app.include_router(billing_router)
 
 
 # -------------------- Job state helpers --------------------
@@ -213,6 +215,8 @@ async def upload(
         users = {}
     if not users.get(user_email, {}).get("verified"):
         raise HTTPException(403, "Please verify your email before uploading. Check your inbox.")
+    if not is_paying(user_email):
+        raise HTTPException(402, "Start your free trial to upload sets — reelcrate.app/app → Upgrade")
     if genre not in GENRE_BPM_RANGES:
         raise HTTPException(400, f"unknown genre '{genre}'")
     if visualizer not in VISUALIZER_STYLES:

@@ -121,6 +121,8 @@ def _public(u: dict) -> dict:
         "name":     u.get("name", u["email"].split("@")[0]),
         "verified": bool(u.get("verified")),
         "mfa_enabled": bool(u.get("mfa_enabled")),
+        "subscription_status": u.get("subscription_status"),
+        "subscription_current_period_end": u.get("subscription_current_period_end"),
     }
 
 
