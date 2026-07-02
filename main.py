@@ -144,7 +144,8 @@ def emergency_cleanup() -> None:
 
 async def process_job(job_id: str, source_path: Path, genre: str,
                       visualizer: str, num_clips: int, clip_length: int,
-                      watermark: str, variation_seed: int = 0) -> None:
+                      watermark: str, variation_seed: int = 0,
+                      bpm_min: float = 0, bpm_max: float = 0) -> None:
     """Run analyze + render in a worker thread. Updates job state as it goes."""
     out_dir = job_dir(job_id)
     state = read_state(job_id) or {}
@@ -160,7 +161,8 @@ async def process_job(job_id: str, source_path: Path, genre: str,
             None,
             lambda: detect_drops(str(source_path), num_clips=num_clips,
                                  clip_len_sec=clip_length, genre=genre,
-                                 variation_seed=variation_seed),
+                                 variation_seed=variation_seed,
+                                 bpm_min=bpm_min, bpm_max=bpm_max),
         )
         clips = assign_hooks(clips)
 
@@ -313,6 +315,8 @@ async def upload(
     clip_length: int = Form(DEFAULT_CLIP_LENGTH),
     watermark: str = Form("@realdjez1"),
     variation_seed: int = Form(0),               # 0 = deterministic; >0 = randomize picks
+    bpm_min: float = Form(0),                    # explicit BPM range (preferred over genre)
+    bpm_max: float = Form(0),
     user_email: str = Depends(current_user),     # gated: sign-in required
 ):
     # Verified-email gate (signup is allowed but upload requires verification).
@@ -326,8 +330,11 @@ async def upload(
         raise HTTPException(403, "Please verify your email before uploading. Check your inbox.")
     if not is_paying(user_email):
         raise HTTPException(402, "Start your free trial to upload sets — reelcrate.app/app → Upgrade")
-    if genre not in GENRE_BPM_RANGES:
-        raise HTTPException(400, f"unknown genre '{genre}'")
+    # The frontend can send an explicit bpm_min/bpm_max range and any string
+    # for genre (used as a display label). Only reject an unknown genre if
+    # NO explicit BPM range was provided AND the genre isn't a known preset.
+    if genre not in GENRE_BPM_RANGES and not (bpm_min > 0 and bpm_max > bpm_min):
+        raise HTTPException(400, f"unknown genre '{genre}' and no bpm range")
     if visualizer not in VISUALIZER_STYLES:
         raise HTTPException(400, f"unknown visualizer '{visualizer}'")
     if not (1 <= num_clips <= 12):
@@ -376,6 +383,8 @@ async def upload(
         "filename": file.filename,
         "size_bytes": size,
         "genre": genre,
+        "bpm_min": bpm_min,
+        "bpm_max": bpm_max,
         "visualizer": visualizer,
         "num_clips": num_clips,
         "clip_length": clip_length,
@@ -391,6 +400,7 @@ async def upload(
     asyncio.create_task(process_job(
         job_id, source_path, genre, visualizer, num_clips, clip_length, watermark,
         variation_seed=variation_seed,
+        bpm_min=bpm_min, bpm_max=bpm_max,
     ))
 
     return JSONResponse({"job_id": job_id, "status_url": f"/api/jobs/{job_id}"})
