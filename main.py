@@ -180,38 +180,78 @@ async def process_job(job_id: str, source_path: Path, genre: str,
         write_state(job_id, state)
 
         rendered = []
+        import subprocess
         for i, c in enumerate(clips):
             out_path = out_dir / f"clip_{c['rank']:02d}.mp4"
-            # Cut a small audio-only WAV of just this clip window so we can
-            # re-render later (with an edited caption) without needing the big
-            # source file — which we delete after processing.
+            # Cut a small MP4 of just this clip window — VIDEO + AUDIO, not
+            # audio-only. This is what render_clip uses as its source, so when
+            # the DJ uploads a video mix we KEEP their footage in the output
+            # (the caption + bars overlay on top). Also lets us re-render
+            # later with a different caption without needing the full source.
+            clip_src = out_dir / f"clip_{c['rank']:02d}_src.mp4"
+            # Keep a backwards-compatible audio-only WAV for jobs whose src
+            # doesn't have video (e.g. mp3 mixes) OR for the rerender endpoint
+            # to fall back to on older jobs.
             clip_audio = out_dir / f"clip_{c['rank']:02d}.wav"
+            cache_ok = False
             try:
-                import subprocess
+                # Re-encode the 30-sec window: cheap, avoids keyframe seeking
+                # gotchas, and keeps file size small (~15–25 MB per clip).
                 subprocess.run(
                     ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                      "-ss", str(c["start_sec"]),
                      "-i", str(source_path),
                      "-t",  str(c["end_sec"] - c["start_sec"]),
-                     "-ac", "1", "-ar", "44100", "-c:a", "pcm_s16le",
-                     str(clip_audio)],
+                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                     "-pix_fmt", "yuv420p",
+                     "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+                     "-movflags", "+faststart",
+                     str(clip_src)],
                     check=True,
                 )
+                cache_ok = True
             except Exception as e:
-                print(f"[warn] could not cache clip audio for rank {c['rank']}: {e}")
+                print(f"[warn] could not cache clip source for rank {c['rank']}: {e}")
 
-            # The clip metadata references the ORIGINAL source's timestamps.
-            # For the render we shift start/end to zero because we're feeding
-            # in the pre-cut clip audio.
+            # Fallback audio-only cache — used only if the MP4 cut failed above.
+            if not cache_ok:
+                try:
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                         "-ss", str(c["start_sec"]),
+                         "-i", str(source_path),
+                         "-t",  str(c["end_sec"] - c["start_sec"]),
+                         "-ac", "1", "-ar", "44100", "-c:a", "pcm_s16le",
+                         str(clip_audio)],
+                        check=True,
+                    )
+                except Exception as e2:
+                    print(f"[warn] could not cache audio-only either: {e2}")
+
+            # Timestamps in `c` reference the ORIGINAL source. For the render
+            # shift them to zero because we're feeding in the pre-cut clip.
             local_clip = {**c, "start_sec": 0.0,
                           "end_sec": c["end_sec"] - c["start_sec"],
                           "peak_sec": max(0.0, c["peak_sec"] - c["start_sec"])}
+
+            # Prefer the video-preserving MP4 cut; fall back to WAV cut; fall
+            # back to full source only if both caches failed.
+            def _pick_source(cs=str(clip_src), ca=str(clip_audio),
+                             src=str(source_path)):
+                if os.path.exists(cs):
+                    return cs, True   # per-clip mp4 → local_clip (t shifted)
+                if os.path.exists(ca):
+                    return ca, True   # per-clip wav → local_clip (t shifted)
+                return src, False     # full source → original c (t not shifted)
+
             ok = await loop.run_in_executor(
                 None,
-                lambda lc=local_clip, p=str(out_path), ca=str(clip_audio): render_clip(
-                    ca if os.path.exists(ca) else str(source_path),
-                    lc if os.path.exists(ca) else c, p, watermark, visualizer,
-                ),
+                lambda lc=local_clip, p=str(out_path): (
+                    lambda picked=_pick_source(): render_clip(
+                        picked[0], lc if picked[1] else c,
+                        p, watermark, visualizer,
+                    )
+                )(),
             )
             if not ok:
                 continue
@@ -386,12 +426,19 @@ async def rerender_clip(job_id: str, rank: int, req: RerenderReq,
         raise HTTPException(404, f"clip {rank} not found")
 
     out_dir = job_dir(job_id)
-    clip_audio = out_dir / f"clip_{rank:02d}.wav"
+    clip_src   = out_dir / f"clip_{rank:02d}_src.mp4"   # preserves video+audio
+    clip_audio = out_dir / f"clip_{rank:02d}.wav"       # audio-only fallback
     out_mp4    = out_dir / f"clip_{rank:02d}.mp4"
 
-    if not clip_audio.exists():
+    # Prefer MP4 cache (keeps user's uploaded video). Fall back to WAV cache
+    # for jobs cached under the pre-MP4-cache scheme.
+    if clip_src.exists():
+        source_for_render = str(clip_src)
+    elif clip_audio.exists():
+        source_for_render = str(clip_audio)
+    else:
         raise HTTPException(410,
-            "Clip audio no longer cached — the job is older than the retention "
+            "Clip source no longer cached — the job is older than the retention "
             "window. Re-upload the set to edit captions."
         )
 
@@ -418,7 +465,7 @@ async def rerender_clip(job_id: str, rank: int, req: RerenderReq,
     loop = asyncio.get_event_loop()
     ok = await loop.run_in_executor(
         None,
-        lambda: render_clip(str(clip_audio), local_clip, str(out_mp4), wm, viz),
+        lambda: render_clip(source_for_render, local_clip, str(out_mp4), wm, viz),
     )
     if not ok:
         raise HTTPException(500, "Re-render failed")
