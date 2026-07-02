@@ -136,6 +136,18 @@ def _bpm_matches_genre(bpm: float, genre: str) -> bool:
     return False
 
 
+def _bpm_in_range(bpm: float, lo: float, hi: float) -> bool:
+    """True if `bpm` or its half/double falls in [lo, hi]. Handles tempo-detection
+    octave ambiguity so a 60 BPM detection of a 120 BPM track still matches
+    the (100, 130) range."""
+    if lo <= 0 or hi <= 0 or hi <= lo:
+        return True   # unset = no filter
+    for candidate in (bpm, bpm * 2, bpm / 2):
+        if lo <= candidate <= hi:
+            return True
+    return False
+
+
 def _ffmpeg_predecode(input_path: str, target_sr: int = 11025) -> tuple[str, str]:
     """
     Convert any input format to two small mono WAV files: main + bass-filtered.
@@ -230,7 +242,8 @@ def _stream_rms_and_flux(wav_path: str, hop: int = 256, n_fft: int = 1024,
 
 def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0,
                  lead_in_sec: float = 6.0, genre: str = "all",
-                 variation_seed: int = 0) -> list[dict]:
+                 variation_seed: int = 0,
+                 bpm_min: float = 0, bpm_max: float = 0) -> list[dict]:
     """
     Returns a list of clip dicts:
       [{start_sec, end_sec, score, peak_sec, energy, flux, bpm, local_bpm, genre_match}, ...]
@@ -242,6 +255,21 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
       - BPM windows re-read directly from the WAV (never hold full audio in RAM)
     """
     import gc
+
+    # Resolve the effective BPM filter range. Explicit bpm_min/bpm_max wins.
+    # Otherwise fall back to the genre → range mapping (backwards compat with
+    # older frontends). A range of (0, 0) means "no filter".
+    if bpm_min > 0 and bpm_max > bpm_min:
+        eff_lo, eff_hi = float(bpm_min), float(bpm_max)
+        filter_active = True
+    else:
+        rng = GENRE_BPM_RANGES.get(genre)
+        if rng is None:
+            eff_lo, eff_hi = 0.0, 0.0
+            filter_active = False
+        else:
+            eff_lo, eff_hi = float(rng[0]), float(rng[1])
+            filter_active = True
 
     # Step 1: ffmpeg pre-decode → small on-disk WAV files
     main_wav, bass_wav = _ffmpeg_predecode(audio_path, target_sr=11025)
@@ -359,7 +387,12 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
         # some agreement, or (b) fall back to the global tempo which we already
         # verified against three set-wide probes.
         trusted = (local_conf >= GENRE_MATCH_MIN_CONF) or (used_global and global_conf >= 0.45)
-        matches = _bpm_matches_genre(local_bpm, genre) if (trusted and genre != "all") else (genre == "all")
+        if not filter_active:
+            matches = True
+        elif not trusted:
+            matches = False   # low-confidence BPMs never count as matches
+        else:
+            matches = _bpm_in_range(local_bpm, eff_lo, eff_hi)
 
         candidates_with_meta.append({
             "frame": frame, "score": sc, "peak_sec": peak_sec,
@@ -380,12 +413,13 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
                           key=lambda c: -c["score"])
     fallback_used = False
 
-    if genre == "all":
-        primary_pool   = matching + non_matching  # everything is "matching" when genre=all
+    if not filter_active:
+        primary_pool   = matching + non_matching  # no filter → everything is a match
         secondary_pool = []
     elif len(matching) == 0:
         # No matches at all — genuine fallback so user still gets clips.
-        print(f"[warn] no moments matched genre '{genre}'. Falling back to all genres.")
+        print(f"[warn] no moments in BPM range [{eff_lo:.0f}, {eff_hi:.0f}]. "
+              f"Falling back to full set.")
         primary_pool   = non_matching
         secondary_pool = []
         fallback_used  = True
@@ -394,8 +428,8 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
         primary_pool   = matching
         secondary_pool = non_matching
         if len(matching) < num_clips:
-            print(f"[warn] only {len(matching)} {genre} moments found; padding "
-                  f"with {num_clips - len(matching)} best overall.")
+            print(f"[warn] only {len(matching)} moments in [{eff_lo:.0f}, "
+                  f"{eff_hi:.0f}] BPM; padding with {num_clips - len(matching)} best overall.")
             fallback_used = True
 
     # Minimum spacing between picked clips — prevents 5 near-identical moments
