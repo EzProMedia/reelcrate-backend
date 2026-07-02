@@ -125,3 +125,28 @@ def send_reset_email(to: str, name: str, token: str) -> bool:
             f'<span style="color:#888;font-size:12px">Didn\'t request this? Someone may have typed your email by mistake. You can ignore this — your password won\'t change.</span>')
     return send_email(to, "Reset your Reelcrate password",
                       _wrap(title, body, _btn("Reset password →", link)))
+
+
+def send_waitlist_welcome(to: str, name: str = "") -> bool:
+    """Sent to DJs who submit the CLAIM SPOT form on the landing page."""
+    title = "You're in. Welcome to the crate."
+    body = (f'Hey {name or "DJ"} —<br><br>'
+            f'You\'re on the Reelcrate early-access list. Free for the first 50 DJs, '
+            f'no card needed, and we\'ll send your access link the day it goes live.<br><br>'
+            f'<b>What Reelcrate does:</b> you drop a set (audio or video), pick a BPM range and a visualizer, '
+            f'and we cut it into 5 ready-to-post 9:16 clips with captions baked in — Reels, TikTok, Shorts.<br><br>'
+            f'<b>While you wait:</b> follow <a href="https://instagram.com/reelcrateapp" style="color:#f5c518">@reelcrateapp</a> '
+            f'for build updates and drops.<br><br>'
+            f'— DJ EZ1 (founder)')
+    return send_email(to, "You're on the Reelcrate list ✓",
+                      _wrap(title, body, _btn("Open reelcrate.app →", APP_URL)))
+
+
+def send_waitlist_alert(to_admin: str, submitter_email: str, name: str = "") -> bool:
+    """Alerts the founder inbox that a new DJ joined the waitlist."""
+    title = "New waitlist signup"
+    body = (f'<b>{submitter_email}</b>'
+            + (f' ({name})' if name else '')
+            + f'<br><br>Sent from the CLAIM SPOT form on reelcrate.app.')
+    return send_email(to_admin, f"[Reelcrate] Waitlist: {submitter_email}",
+                      _wrap(title, body))
