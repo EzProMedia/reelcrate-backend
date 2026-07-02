@@ -28,6 +28,7 @@ from typing import Optional
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
 
 # Engine modules live alongside this file (flat layout for simpler deploys).
 sys.path.insert(0, str(Path(__file__).parent))
@@ -180,10 +181,35 @@ async def process_job(job_id: str, source_path: Path, genre: str,
         rendered = []
         for i, c in enumerate(clips):
             out_path = out_dir / f"clip_{c['rank']:02d}.mp4"
+            # Cut a small audio-only WAV of just this clip window so we can
+            # re-render later (with an edited caption) without needing the big
+            # source file — which we delete after processing.
+            clip_audio = out_dir / f"clip_{c['rank']:02d}.wav"
+            try:
+                import subprocess
+                subprocess.run(
+                    ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                     "-ss", str(c["start_sec"]),
+                     "-i", str(source_path),
+                     "-t",  str(c["end_sec"] - c["start_sec"]),
+                     "-ac", "1", "-ar", "44100", "-c:a", "pcm_s16le",
+                     str(clip_audio)],
+                    check=True,
+                )
+            except Exception as e:
+                print(f"[warn] could not cache clip audio for rank {c['rank']}: {e}")
+
+            # The clip metadata references the ORIGINAL source's timestamps.
+            # For the render we shift start/end to zero because we're feeding
+            # in the pre-cut clip audio.
+            local_clip = {**c, "start_sec": 0.0,
+                          "end_sec": c["end_sec"] - c["start_sec"],
+                          "peak_sec": max(0.0, c["peak_sec"] - c["start_sec"])}
             ok = await loop.run_in_executor(
                 None,
-                lambda c=c, p=str(out_path): render_clip(
-                    str(source_path), c, p, watermark, visualizer
+                lambda lc=local_clip, p=str(out_path), ca=str(clip_audio): render_clip(
+                    ca if os.path.exists(ca) else str(source_path),
+                    lc if os.path.exists(ca) else c, p, watermark, visualizer,
                 ),
             )
             if not ok:
@@ -333,6 +359,76 @@ async def job_status(job_id: str):
     if not state:
         raise HTTPException(404, "job not found (may have expired)")
     return state
+
+
+class RerenderReq(BaseModel):
+    caption: str
+    visualizer: Optional[str] = None
+    watermark: Optional[str] = None
+
+
+@app.post("/api/clips/{job_id}/{rank}/rerender")
+async def rerender_clip(job_id: str, rank: int, req: RerenderReq,
+                        user_email: str = Depends(current_user)):
+    """Re-render an existing clip with a new caption. Fast — uses the cached
+    per-clip audio window, not the full source."""
+    state = read_state(job_id)
+    if not state:
+        raise HTTPException(404, "job not found (may have expired)")
+    if state.get("owner_email") != user_email:
+        raise HTTPException(403, "not your job")
+
+    clip_meta = next((c for c in state.get("clips", []) if int(c.get("rank", 0)) == rank), None)
+    if not clip_meta:
+        raise HTTPException(404, f"clip {rank} not found")
+
+    out_dir = job_dir(job_id)
+    clip_audio = out_dir / f"clip_{rank:02d}.wav"
+    out_mp4    = out_dir / f"clip_{rank:02d}.mp4"
+
+    if not clip_audio.exists():
+        raise HTTPException(410,
+            "Clip audio no longer cached — the job is older than the retention "
+            "window. Re-upload the set to edit captions."
+        )
+
+    # Build a minimal clip dict for render_clip. Use the caption text as the
+    # custom_title override (render.py picks it up via clip.get('custom_title')).
+    duration = float(clip_meta.get("duration_sec") or 30)
+    local_clip = {
+        "rank": rank,
+        "start_sec": 0.0,
+        "end_sec":   duration,
+        "peak_sec":  min(duration * 0.2, 6.0),
+        "hook":      clip_meta.get("hook", ""),
+        "custom_title": (req.caption or "").strip() or clip_meta.get("hook", ""),
+        "tag":       clip_meta.get("tag", "MOMENT"),
+        "bpm":       clip_meta.get("bpm") or 0,
+        "local_bpm": clip_meta.get("local_bpm") or 0,
+        "bpm_confidence":       clip_meta.get("bpm_confidence") or 0,
+        "local_bpm_confidence": clip_meta.get("local_bpm_confidence") or 0,
+    }
+
+    wm = req.watermark or state.get("watermark") or "@realdjez1"
+    viz = req.visualizer or state.get("visualizer") or "freq_bars"
+
+    loop = asyncio.get_event_loop()
+    ok = await loop.run_in_executor(
+        None,
+        lambda: render_clip(str(clip_audio), local_clip, str(out_mp4), wm, viz),
+    )
+    if not ok:
+        raise HTTPException(500, "Re-render failed")
+
+    # Update the persisted state so /jobs returns the new caption.
+    for c in state.get("clips", []):
+        if int(c.get("rank", 0)) == rank:
+            c["hook"] = local_clip["custom_title"]
+    write_state(job_id, state)
+
+    # Cache-bust query so the browser refetches the new bytes.
+    return {"ok": True,
+            "url": f"/api/clips/{job_id}/clip_{rank:02d}.mp4?v={int(time.time())}"}
 
 
 @app.get("/api/clips/{job_id}/{filename}")
