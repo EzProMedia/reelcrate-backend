@@ -148,22 +148,22 @@ def render_clip(source: str, clip: dict, out_path: str, watermark: str,
         f"fontsize=32:x=w-tw-40:y=46:box=1:boxcolor={YELLOW}:boxborderw=12"
     )
 
-    # BPM (bottom-right) — only if confident
+    # BPM (bottom-right) — small, above the caption area so it doesn't collide
     if bpm_text:
         text_filters.append(
             f"drawtext=fontfile={FONT_BOLD}:text='{bpm_text}':fontcolor={YELLOW}:"
-            f"fontsize=28:x=w-tw-40:y=h-90:shadowcolor=black@0.6:shadowx=2:shadowy=2"
+            f"fontsize=26:x=w-tw-40:y=44:shadowcolor=black@0.6:shadowx=2:shadowy=2"
         )
 
-    # Watermark (bottom-left)
+    # Watermark (bottom-left) — very bottom, safely below the caption block
     text_filters.append(
         f"drawtext=fontfile={FONT_BOLD}:text='{safe_wm}':fontcolor={WHITE}:"
-        f"fontsize=28:x=40:y=h-90:shadowcolor=black@0.6:shadowx=2:shadowy=2"
+        f"fontsize=26:x=40:y=h-56:shadowcolor=black@0.6:shadowx=2:shadowy=2:alpha=0.75"
     )
 
-    # Big hook caption — centered, ~mid-low, yellow bold
-    # Wrap long hooks into ~22-char lines (rough heuristic)
-    def wrap(text, width=22):
+    # Caption sits at the VERY BOTTOM — matches the app's clip-preview layout.
+    # Wrap long hooks into ~18-char lines.
+    def wrap(text, width=18):
         words = text.split()
         lines, cur = [], ""
         for w in words:
@@ -177,16 +177,23 @@ def render_clip(source: str, clip: dict, out_path: str, watermark: str,
             lines.append(cur)
         return lines
 
-    hook_lines = wrap(hook.upper(), width=18)[:3]
-    line_h = 96
-    block_h = line_h * len(hook_lines)
-    base_y = H - 520 - block_h  # ~mid-low
+    hook_lines = wrap(display_text.upper(), width=18)[:3]
+    # Slightly smaller than before so 3-line captions still fit under the bars.
+    line_h    = 76
+    caption_fs = 62
+    block_h    = line_h * len(hook_lines)
+
+    # Caption block anchored ~120 px from bottom of frame.
+    caption_bottom_margin = 120
+    caption_top_y = H - caption_bottom_margin - block_h
+
     for i, ln in enumerate(hook_lines):
         safe_ln = ff_escape_text(ln)
         text_filters.append(
-            f"drawtext=fontfile={FONT_BOLD}:text='{safe_ln}':fontcolor={YELLOW}:"
-            f"fontsize=84:x=(w-tw)/2:y={base_y + i*line_h}:"
-            f"shadowcolor=black:shadowx=3:shadowy=3"
+            f"drawtext=fontfile={FONT_BOLD}:text='{safe_ln}':fontcolor=white:"
+            f"fontsize={caption_fs}:x=(w-tw)/2:y={caption_top_y + i*line_h}:"
+            f"shadowcolor=black@0.85:shadowx=3:shadowy=3:"
+            f"box=1:boxcolor=black@0.35:boxborderw=14"
         )
 
     # ---------- Construct video base ----------
@@ -218,8 +225,10 @@ def render_clip(source: str, clip: dict, out_path: str, watermark: str,
     # Compose: bg → overlay waveform near bottom → drawtext stack
     text_chain = ",".join(text_filters)
 
-    # Position the waveform strip just above the hook block
-    wave_y = base_y - wave_h - 40
+    # Waveform strip sits just ABOVE the caption block, matching the
+    # composition in the app preview (bars low, caption underneath).
+    wave_gap  = 40
+    wave_y    = caption_top_y - wave_h - wave_gap
 
     if has_video:
         full_filter = (
