@@ -351,43 +351,67 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
             "genre_match": matches,
         })
 
-    # 9) Apply genre filter — but fall back to unfiltered if too few match
-    filtered = [c for c in candidates_with_meta if c["genre_match"]]
+    # 9) Split candidates into "matches the selected genre" vs "doesn't", each
+    #    sorted by score. We ALWAYS prefer matching clips — even if a higher-
+    #    scoring off-genre moment exists. Only fill remaining slots with
+    #    non-matching peaks when we don't have num_clips matches. Fallback to
+    #    "all" only when ZERO clips match (previously the fallback discarded
+    #    genre priority by re-sorting everything together, which is why
+    #    picking Afrobeats returned R&B clips from mixed sets).
+    matching     = sorted([c for c in candidates_with_meta if c["genre_match"]],
+                          key=lambda c: -c["score"])
+    non_matching = sorted([c for c in candidates_with_meta if not c["genre_match"]],
+                          key=lambda c: -c["score"])
     fallback_used = False
-    if genre != "all" and len(filtered) < num_clips:
-        if len(filtered) == 0:
-            print(f"[warn] no moments matched genre '{genre}'. Falling back to all genres.")
-            filtered = candidates_with_meta
-            fallback_used = True
-        else:
-            # Partial match: fill remaining slots with best non-matching peaks
-            print(f"[warn] only {len(filtered)} {genre} moments found; padding with best overall.")
-            remaining = [c for c in candidates_with_meta if not c["genre_match"]]
-            filtered = filtered + remaining
+
+    if genre == "all":
+        primary_pool   = matching + non_matching  # everything is "matching" when genre=all
+        secondary_pool = []
+    elif len(matching) == 0:
+        # No matches at all — genuine fallback so user still gets clips.
+        print(f"[warn] no moments matched genre '{genre}'. Falling back to all genres.")
+        primary_pool   = non_matching
+        secondary_pool = []
+        fallback_used  = True
+    else:
+        # Matching pool has priority. Non-matching only fills leftover slots.
+        primary_pool   = matching
+        secondary_pool = non_matching
+        if len(matching) < num_clips:
+            print(f"[warn] only {len(matching)} {genre} moments found; padding "
+                  f"with {num_clips - len(matching)} best overall.")
             fallback_used = True
 
-    # Take top-N from filtered. If variation_seed is set, sample from a wider
-    # top-K pool (weighted by score) so re-uploading the same set gives a
-    # different mix of moments each time. Otherwise fall back to deterministic
-    # highest-score picks.
-    filtered_by_score = sorted(filtered, key=lambda c: -c["score"])
-    if variation_seed and len(filtered_by_score) > num_clips:
-        import random as _random
-        pool_size = min(len(filtered_by_score), max(num_clips * 2, num_clips + 3))
-        pool = filtered_by_score[:pool_size]
-        rng = _random.Random(int(variation_seed))
-        # Weight by score so bangers still dominate, but the exact mix varies.
-        weights = [max(0.01, float(c["score"])) for c in pool]
-        selected = []
-        for _ in range(num_clips):
-            if not pool:
-                break
-            pick = rng.choices(pool, weights=weights, k=1)[0]
-            selected.append(pick)
-            i = pool.index(pick)
-            pool.pop(i); weights.pop(i)
-    else:
-        selected = filtered_by_score[:num_clips]
+    def _pick_from_pool(pool: list[dict], k: int, seed: int) -> list[dict]:
+        """Pick up to k clips from `pool`. With a seed, weighted-random from a
+        top-K subpool so re-uploads produce a different mix. Without a seed,
+        deterministic top-k by score."""
+        if k <= 0 or not pool:
+            return []
+        if seed and len(pool) > k:
+            import random as _random
+            rng = _random.Random(int(seed))
+            pool_size = min(len(pool), max(k * 2, k + 3))
+            sub = list(pool[:pool_size])
+            weights = [max(0.01, float(c["score"])) for c in sub]
+            out = []
+            for _ in range(k):
+                if not sub:
+                    break
+                pick = rng.choices(sub, weights=weights, k=1)[0]
+                out.append(pick)
+                idx = sub.index(pick)
+                sub.pop(idx); weights.pop(idx)
+            return out
+        return list(pool[:k])
+
+    selected = _pick_from_pool(primary_pool, num_clips, variation_seed)
+    remaining_slots = num_clips - len(selected)
+    if remaining_slots > 0 and secondary_pool:
+        # Use a slightly different seed for the secondary pool so the same
+        # positions in the two pools don't collide on identical picks.
+        selected += _pick_from_pool(secondary_pool, remaining_slots,
+                                    variation_seed + 1 if variation_seed else 0)
     selected.sort(key=lambda c: c["frame"])
 
     # Clean up the temporary pre-decoded WAV files (best-effort)
