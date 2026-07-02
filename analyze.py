@@ -28,24 +28,26 @@ import random
 # ---------------- Genre → BPM range mapping ----------------
 # Local BPM around each peak must fall in this range (or its half/double for
 # tempo-detection ambiguity). Set "all" to skip filtering.
+# Ranges reflect real-world style spans, not textbook BPM. Room-mic recordings
+# have wobbly tempo estimates so being generous here rescues real matches.
 GENRE_BPM_RANGES = {
-    "hiphop":    (75, 100),
-    "trap":      (130, 175),   # often double-time of half-time
-    "reggae":    (60, 90),
-    "dancehall": (88, 110),
-    "afrobeats": (95, 115),
-    "afrohouse": (115, 125),
-    "amapiano":  (108, 116),
-    "reggaeton": (88, 100),
-    "house":     (120, 128),
-    "techhouse": (122, 130),
-    "deephouse": (118, 125),
-    "disco":     (110, 125),
-    "techno":    (128, 140),
-    "trance":    (130, 145),
-    "hardstyle": (145, 165),
-    "dnb":       (160, 185),
-    "dubstep":   (138, 145),
+    "hiphop":    (70, 105),    # trap-tinged hip-hop drifts to 100+
+    "trap":      (125, 175),   # often double-time of half-time
+    "reggae":    (60, 92),
+    "dancehall": (85, 112),
+    "afrobeats": (90, 120),    # was 95-115 — too narrow, missed real matches
+    "afrohouse": (110, 128),   # was 115-125
+    "amapiano":  (100, 122),   # was 108-116
+    "reggaeton": (85, 105),
+    "house":     (118, 130),   # was 120-128
+    "techhouse": (120, 132),
+    "deephouse": (115, 128),
+    "disco":     (105, 125),
+    "techno":    (125, 145),
+    "trance":    (128, 148),
+    "hardstyle": (140, 165),
+    "dnb":       (155, 190),
+    "dubstep":   (135, 150),
     "all":       None,         # no filter
 }
 GENRE_PRETTY = {
@@ -338,13 +340,27 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
         finally:
             del y_win; gc.collect()
 
+    # Confidence gate: below this we don't trust the BPM enough to call it a
+    # genre match. Room-mic recordings often produce wobbly BPMs; we'd rather
+    # demote a low-confidence peak to the "secondary" pool than let a bogus
+    # BPM either pass or fail the genre check erroneously.
+    GENRE_MATCH_MIN_CONF = 0.30
+
     candidates_with_meta = []
     for frame, sc in ranked_candidates:
         peak_sec = float(frame * frame_sec)
         local_bpm, local_conf = _local_bpm_streamed(peak_sec)
+        used_global = False
         if local_bpm == 0.0:
             local_bpm, local_conf = global_bpm, global_conf
-        matches = _bpm_matches_genre(local_bpm, genre)
+            used_global = True
+
+        # A "trusted" BPM has to (a) come from the local window with at least
+        # some agreement, or (b) fall back to the global tempo which we already
+        # verified against three set-wide probes.
+        trusted = (local_conf >= GENRE_MATCH_MIN_CONF) or (used_global and global_conf >= 0.45)
+        matches = _bpm_matches_genre(local_bpm, genre) if (trusted and genre != "all") else (genre == "all")
+
         candidates_with_meta.append({
             "frame": frame, "score": sc, "peak_sec": peak_sec,
             "local_bpm": local_bpm, "local_bpm_confidence": local_conf,
@@ -382,36 +398,78 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
                   f"with {num_clips - len(matching)} best overall.")
             fallback_used = True
 
-    def _pick_from_pool(pool: list[dict], k: int, seed: int) -> list[dict]:
-        """Pick up to k clips from `pool`. With a seed, weighted-random from a
-        top-K subpool so re-uploads produce a different mix. Without a seed,
-        deterministic top-k by score."""
+    # Minimum spacing between picked clips — prevents 5 near-identical moments
+    # from the same 3-minute section of the set.
+    MIN_PICK_GAP_SEC = 90.0
+
+    def _pick_from_pool(pool: list[dict], k: int, seed: int,
+                        already_picked: list[dict] | None = None) -> list[dict]:
+        """Pick up to k clips from `pool`. Enforces MIN_PICK_GAP_SEC spacing
+        between picks (relative to each other AND to already_picked). With a
+        seed, weighted-random from a wider top-K subpool so re-uploads produce
+        a different mix. Without a seed, deterministic top-k by score."""
         if k <= 0 or not pool:
             return []
-        if seed and len(pool) > k:
+        picked = list(already_picked or [])
+
+        def _far_enough(cand):
+            for p in picked:
+                if abs(cand["peak_sec"] - p["peak_sec"]) < MIN_PICK_GAP_SEC:
+                    return False
+            return True
+
+        # Wider pool so the spacing filter has room to work.
+        pool_size = min(len(pool), max(k * 4, k + 8))
+        sub = list(pool[:pool_size])
+
+        if seed:
             import random as _random
             rng = _random.Random(int(seed))
-            pool_size = min(len(pool), max(k * 2, k + 3))
-            sub = list(pool[:pool_size])
             weights = [max(0.01, float(c["score"])) for c in sub]
             out = []
-            for _ in range(k):
-                if not sub:
-                    break
-                pick = rng.choices(sub, weights=weights, k=1)[0]
-                out.append(pick)
+            while len(out) < k and sub:
+                # Try to pick something that respects spacing. If nothing
+                # respects it, relax and take the top of what's left.
+                candidates = [(c, w) for c, w in zip(sub, weights) if _far_enough(c)]
+                if not candidates:
+                    # Relaxed pick: strongest remaining candidate.
+                    pick = max(zip(sub, weights), key=lambda x: x[1])[0]
+                else:
+                    cands, ws = zip(*candidates)
+                    pick = rng.choices(list(cands), weights=list(ws), k=1)[0]
+                out.append(pick); picked.append(pick)
                 idx = sub.index(pick)
                 sub.pop(idx); weights.pop(idx)
             return out
-        return list(pool[:k])
+        else:
+            # Deterministic: walk down by score, keep only if far enough.
+            out = []
+            for c in sub:
+                if len(out) >= k:
+                    break
+                if _far_enough(c):
+                    out.append(c); picked.append(c)
+            # If we didn't fill k slots, take the best remaining without gap.
+            if len(out) < k:
+                for c in sub:
+                    if len(out) >= k:
+                        break
+                    if c not in out:
+                        out.append(c)
+            return out
 
     selected = _pick_from_pool(primary_pool, num_clips, variation_seed)
     remaining_slots = num_clips - len(selected)
     if remaining_slots > 0 and secondary_pool:
         # Use a slightly different seed for the secondary pool so the same
-        # positions in the two pools don't collide on identical picks.
-        selected += _pick_from_pool(secondary_pool, remaining_slots,
-                                    variation_seed + 1 if variation_seed else 0)
+        # positions in the two pools don't collide on identical picks. Pass
+        # the primary picks in as `already_picked` so the spacing filter also
+        # spreads secondary picks away from primary ones.
+        selected += _pick_from_pool(
+            secondary_pool, remaining_slots,
+            variation_seed + 1 if variation_seed else 0,
+            already_picked=selected,
+        )
     selected.sort(key=lambda c: c["frame"])
 
     # Clean up the temporary pre-decoded WAV files (best-effort)
