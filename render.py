@@ -46,7 +46,7 @@ def _visualizer_filter(style: str, w: int, yellow: str) -> tuple[str, int]:
         # force-tint to brand yellow via channel mixer (zero blue, dim green).
         ht = 320
         f = (
-            f"[0:a]showfreqs=s={w}x{ht}:mode=bar:fscale=log:ascale=log:"
+            f"[amain]showfreqs=s={w}x{ht}:mode=bar:fscale=log:ascale=log:"
             f"win_size=2048:cmode=combined,"
             f"format=yuva420p,colorchannelmixer=rr=1:rg=1:rb=1:gr=0.9:gg=0.9:gb=0.9:"
             f"br=0:bg=0:bb=0:aa=0.65[wave]"
@@ -56,7 +56,7 @@ def _visualizer_filter(style: str, w: int, yellow: str) -> tuple[str, int]:
         # Scrolling spectrogram strip, fire-style ramp (we recolor to brand yellow)
         ht = 180
         f = (
-            f"[0:a]showspectrum=s={w}x{ht}:mode=combined:slide=scroll:scale=cbrt:"
+            f"[amain]showspectrum=s={w}x{ht}:mode=combined:slide=scroll:scale=cbrt:"
             f"color=intensity:fps={FPS},format=yuva420p,"
             f"colorchannelmixer=rr=1:gg=0.85:bb=0:aa=0.85[wave]"
         )
@@ -65,7 +65,7 @@ def _visualizer_filter(style: str, w: int, yellow: str) -> tuple[str, int]:
         # Two-tone wave: yellow + white outline — more visual depth
         ht = 240
         f = (
-            f"[0:a]showwaves=s={w}x{ht}:mode=line:colors={yellow}|0xFFFFFF:rate={FPS}:"
+            f"[amain]showwaves=s={w}x{ht}:mode=line:colors={yellow}|0xFFFFFF:rate={FPS}:"
             f"draw=full:n=80,format=yuva420p,colorchannelmixer=aa=0.85[wave]"
         )
         return f, ht
@@ -73,7 +73,7 @@ def _visualizer_filter(style: str, w: int, yellow: str) -> tuple[str, int]:
         # Constant-Q transform — looks like a frequency rainbow that pulses
         ht = 260
         f = (
-            f"[0:a]showcqt=s={w}x{ht}:fps={FPS}:basefreq=40:endfreq=4000:count=16:"
+            f"[amain]showcqt=s={w}x{ht}:fps={FPS}:basefreq=40:endfreq=4000:count=16:"
             f"text=0:bar_g=2:tlength=0.25,format=yuva420p,"
             f"colorchannelmixer=rr=1:gg=0.85:bb=0:aa=0.82[wave]"
         )
@@ -81,7 +81,7 @@ def _visualizer_filter(style: str, w: int, yellow: str) -> tuple[str, int]:
     # default: clean_waves — thin single line, modern minimal look
     ht = 200
     f = (
-        f"[0:a]showwaves=s={w}x{ht}:mode=line:colors={yellow}:rate={FPS}:"
+        f"[amain]showwaves=s={w}x{ht}:mode=line:colors={yellow}:rate={FPS}:"
         f"draw=full:n=120,format=yuva420p,colorchannelmixer=aa=0.92[wave]"
     )
     return f, ht
@@ -205,21 +205,33 @@ def render_clip(source: str, clip: dict, out_path: str, watermark: str,
     )
     has_video = "video" in probe.stdout
 
+    # Always split the audio stream: one copy for the foreground waveform,
+    # one copy for the fullscreen backdrop (or dropped, if the source has video).
+    audio_split = "[0:a]asplit=2[abg][amain];"
+
     if has_video:
         # Scale-and-crop the source video to 9:16. Use scale=-2:H to size by height
         # (works for landscape sources where we'd otherwise underfill), force_original
         # ensures we always have enough pixels in both directions, then crop center.
         video_chain = (
+            f"{audio_split}"
             f"[0:v]scale=w='if(gt(a,{W}/{H}),-2,{W})':h='if(gt(a,{W}/{H}),{H},-2)',"
             f"crop={W}:{H}:(iw-{W})/2:(ih-{H})/2,"
             f"setsar=1,"
-            f"eq=brightness=-0.05:saturation=1.1[bg]"
+            f"eq=brightness=-0.05:saturation=1.1[bg];"
+            # [abg] is unused in the has_video branch — anullsink drains it.
+            f"[abg]anullsink"
         )
     else:
-        # No video — synthesize dark gradient with subtle vignette
+        # No source video — build a moody full-frame spectrogram behind the
+        # small waveform strip so the frame is never a black rectangle.
         video_chain = (
-            f"color=c=0x0a0a0a:s={W}x{H}:r={FPS}:d={duration}[bg0];"
-            f"[bg0]format=yuv420p[bg]"
+            f"{audio_split}"
+            f"color=c=0x141414:s={W}x{H}:r={FPS}:d={duration},format=yuv420p[bgbase];"
+            f"[abg]showspectrum=s={W}x{H}:mode=combined:slide=scroll:scale=cbrt:"
+            f"color=fire:fps={FPS},format=yuva420p,"
+            f"colorchannelmixer=rr=1:gg=0.75:bb=0.20:aa=0.55[bgspec];"
+            f"[bgbase][bgspec]overlay=0:0,format=yuv420p[bg]"
         )
 
     # Compose: bg → overlay waveform near bottom → drawtext stack
@@ -230,24 +242,14 @@ def render_clip(source: str, clip: dict, out_path: str, watermark: str,
     wave_gap  = 40
     wave_y    = caption_top_y - wave_h - wave_gap
 
-    if has_video:
-        full_filter = (
-            f"{video_chain};"
-            f"{wave_filter};"
-            f"[bg][wave]overlay=0:{wave_y}[vbg];"
-            f"[vbg]{text_chain}[vout]"
-        )
-        inputs = ["-ss", str(start), "-t", str(duration), "-i", source]
-        map_args = ["-map", "[vout]", "-map", "0:a"]
-    else:
-        full_filter = (
-            f"{video_chain};"
-            f"{wave_filter};"
-            f"[bg][wave]overlay=0:{wave_y}[vbg];"
-            f"[vbg]{text_chain}[vout]"
-        )
-        inputs = ["-ss", str(start), "-t", str(duration), "-i", source]
-        map_args = ["-map", "[vout]", "-map", "0:a"]
+    full_filter = (
+        f"{video_chain};"
+        f"{wave_filter};"
+        f"[bg][wave]overlay=0:{wave_y}[vbg];"
+        f"[vbg]{text_chain}[vout]"
+    )
+    inputs = ["-ss", str(start), "-t", str(duration), "-i", source]
+    map_args = ["-map", "[vout]", "-map", "0:a"]
 
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
