@@ -5,6 +5,7 @@ Endpoints:
   POST   /api/upload            Upload a DJ set, returns job_id
   GET    /api/jobs/{job_id}     Get processing status + progress + clip URLs
   GET    /api/clips/{job_id}/{filename}   Serve a clip MP4
+  POST   /api/waitlist          Landing-page CLAIM SPOT form
   GET    /healthz               Health check
 
 Run locally:
@@ -512,6 +513,84 @@ async def root():
         "docs": "/docs",
         "health": "/healthz",
     }
+
+
+# -------------------- Waitlist (landing page CLAIM SPOT form) --------------------
+
+WAITLIST_FILE = DATA_ROOT / "waitlist.json"
+ADMIN_EMAIL   = os.environ.get("ADMIN_EMAIL", "ezanaberhe@gmail.com")
+
+
+class WaitlistReq(BaseModel):
+    email: str
+    name: Optional[str] = ""
+    handle: Optional[str] = ""
+    source: Optional[str] = "reelcrate.app"
+
+
+def _load_waitlist() -> list:
+    if not WAITLIST_FILE.exists():
+        return []
+    try:
+        return json.loads(WAITLIST_FILE.read_text())
+    except Exception:
+        return []
+
+
+def _save_waitlist(entries: list) -> None:
+    try:
+        WAITLIST_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = WAITLIST_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(entries, indent=2))
+        tmp.replace(WAITLIST_FILE)
+    except Exception as e:
+        print(f"[waitlist] save failed: {e}")
+
+
+@app.post("/api/waitlist")
+async def join_waitlist(req: WaitlistReq):
+    """Landing-page CLAIM SPOT form posts here. Records the entry, sends the
+    submitter a welcome email so they know they made it onto the list, and
+    fires an alert to the founder inbox."""
+    from email_service import send_waitlist_welcome, send_waitlist_alert
+    email = (req.email or "").strip().lower()
+    if "@" not in email or "." not in email:
+        raise HTTPException(400, "invalid email")
+
+    entries = _load_waitlist()
+    # De-dup by email — resubmit still fires the confirmation, but we don't
+    # store the same row twice.
+    already = any((e.get("email") or "").lower() == email for e in entries)
+    if not already:
+        entries.append({
+            "email": email,
+            "name":   (req.name or "").strip(),
+            "handle": (req.handle or "").strip(),
+            "source": req.source or "reelcrate.app",
+            "joined_at": int(time.time()),
+        })
+        _save_waitlist(entries)
+
+    # Fire both emails in a background thread so the HTTP response is fast.
+    def _send():
+        try:
+            send_waitlist_welcome(email, (req.name or "").strip())
+            send_waitlist_alert(ADMIN_EMAIL, email, (req.name or "").strip())
+        except Exception as e:
+            print(f"[waitlist] send failed: {e}")
+    asyncio.create_task(asyncio.to_thread(_send))
+
+    return {"ok": True, "already_on_list": already, "total": len(entries)}
+
+
+@app.get("/api/admin/waitlist")
+async def admin_waitlist(token: str = ""):
+    """Peek at the current waitlist. Gated with JWT_SECRET."""
+    from auth import JWT_SECRET
+    if token != JWT_SECRET:
+        raise HTTPException(401, "bad token")
+    entries = _load_waitlist()
+    return {"count": len(entries), "entries": entries}
 
 
 @app.get("/api/admin/disk")
