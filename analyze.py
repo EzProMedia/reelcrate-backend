@@ -227,7 +227,8 @@ def _stream_rms_and_flux(wav_path: str, hop: int = 256, n_fft: int = 1024,
 
 
 def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0,
-                 lead_in_sec: float = 6.0, genre: str = "all") -> list[dict]:
+                 lead_in_sec: float = 6.0, genre: str = "all",
+                 variation_seed: int = 0) -> list[dict]:
     """
     Returns a list of clip dicts:
       [{start_sec, end_sec, score, peak_sec, energy, flux, bpm, local_bpm, genre_match}, ...]
@@ -365,8 +366,28 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
             filtered = filtered + remaining
             fallback_used = True
 
-    # Take top-N from filtered, then re-sort to time order
-    selected = sorted(filtered, key=lambda c: -c["score"])[:num_clips]
+    # Take top-N from filtered. If variation_seed is set, sample from a wider
+    # top-K pool (weighted by score) so re-uploading the same set gives a
+    # different mix of moments each time. Otherwise fall back to deterministic
+    # highest-score picks.
+    filtered_by_score = sorted(filtered, key=lambda c: -c["score"])
+    if variation_seed and len(filtered_by_score) > num_clips:
+        import random as _random
+        pool_size = min(len(filtered_by_score), max(num_clips * 2, num_clips + 3))
+        pool = filtered_by_score[:pool_size]
+        rng = _random.Random(int(variation_seed))
+        # Weight by score so bangers still dominate, but the exact mix varies.
+        weights = [max(0.01, float(c["score"])) for c in pool]
+        selected = []
+        for _ in range(num_clips):
+            if not pool:
+                break
+            pick = rng.choices(pool, weights=weights, k=1)[0]
+            selected.append(pick)
+            i = pool.index(pick)
+            pool.pop(i); weights.pop(i)
+    else:
+        selected = filtered_by_score[:num_clips]
     selected.sort(key=lambda c: c["frame"])
 
     # Clean up the temporary pre-decoded WAV files (best-effort)
