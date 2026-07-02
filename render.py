@@ -206,7 +206,7 @@ def render_clip(source: str, clip: dict, out_path: str, watermark: str,
     has_video = "video" in probe.stdout
 
     # Always split the audio stream: one copy for the foreground waveform,
-    # one copy for the fullscreen backdrop (or dropped, if the source has video).
+    # one copy for the fullscreen backdrop (or drained, if the source has video).
     audio_split = "[0:a]asplit=2[abg][amain];"
 
     if has_video:
@@ -223,15 +223,18 @@ def render_clip(source: str, clip: dict, out_path: str, watermark: str,
             f"[abg]anullsink"
         )
     else:
-        # No source video — build a moody full-frame spectrogram behind the
-        # small waveform strip so the frame is never a black rectangle.
+        # No source video — fill the frame with a full-screen CQT visualizer
+        # painted over a warm dark base. showcqt draws colored bars across the
+        # WHOLE width every frame (unlike showspectrum which scrolls in over
+        # time and leaves 90 % of a short clip black). Guaranteed content in
+        # every part of the frame from t=0.
         video_chain = (
             f"{audio_split}"
-            f"color=c=0x141414:s={W}x{H}:r={FPS}:d={duration},format=yuv420p[bgbase];"
-            f"[abg]showspectrum=s={W}x{H}:mode=combined:slide=scroll:scale=cbrt:"
-            f"color=fire:fps={FPS},format=yuva420p,"
-            f"colorchannelmixer=rr=1:gg=0.75:bb=0.20:aa=0.55[bgspec];"
-            f"[bgbase][bgspec]overlay=0:0,format=yuv420p[bg]"
+            f"color=c=0x1a1005:s={W}x{H}:r={FPS}:d={duration},format=yuv420p[bgbase];"
+            f"[abg]showcqt=s={W}x{H}:fps={FPS}:basefreq=30:endfreq=8000:count=8:"
+            f"bar_g=2:tlength=0.25:text=0,format=yuva420p,"
+            f"colorchannelmixer=rr=1:gg=0.72:bb=0.18:aa=0.80[bgcqt];"
+            f"[bgbase][bgcqt]overlay=0:0,format=yuv420p[bg]"
         )
 
     # Compose: bg → overlay waveform near bottom → drawtext stack
