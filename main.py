@@ -144,7 +144,7 @@ def emergency_cleanup() -> None:
 
 async def process_job(job_id: str, source_path: Path, genre: str,
                       visualizer: str, num_clips: int, clip_length: int,
-                      watermark: str) -> None:
+                      watermark: str, variation_seed: int = 0) -> None:
     """Run analyze + render in a worker thread. Updates job state as it goes."""
     out_dir = job_dir(job_id)
     state = read_state(job_id) or {}
@@ -159,7 +159,8 @@ async def process_job(job_id: str, source_path: Path, genre: str,
         clips = await loop.run_in_executor(
             None,
             lambda: detect_drops(str(source_path), num_clips=num_clips,
-                                 clip_len_sec=clip_length, genre=genre),
+                                 clip_len_sec=clip_length, genre=genre,
+                                 variation_seed=variation_seed),
         )
         clips = assign_hooks(clips)
 
@@ -271,6 +272,7 @@ async def upload(
     num_clips: int = Form(DEFAULT_NUM_CLIPS),
     clip_length: int = Form(DEFAULT_CLIP_LENGTH),
     watermark: str = Form("@realdjez1"),
+    variation_seed: int = Form(0),               # 0 = deterministic; >0 = randomize picks
     user_email: str = Depends(current_user),     # gated: sign-in required
 ):
     # Verified-email gate (signup is allowed but upload requires verification).
@@ -347,7 +349,8 @@ async def upload(
 
     # Kick off processing in the background. We don't await it.
     asyncio.create_task(process_job(
-        job_id, source_path, genre, visualizer, num_clips, clip_length, watermark
+        job_id, source_path, genre, visualizer, num_clips, clip_length, watermark,
+        variation_seed=variation_seed,
     ))
 
     return JSONResponse({"job_id": job_id, "status_url": f"/api/jobs/{job_id}"})
