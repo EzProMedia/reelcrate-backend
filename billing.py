@@ -171,9 +171,35 @@ def _apply_subscription(sub: dict):
     u = users.get(email)
     if not u:
         return
+
+    new_status = sub.get("status")
     u["subscription_id"] = sub.get("id")
-    u["subscription_status"] = sub.get("status")
+    u["subscription_status"] = new_status
     u["subscription_current_period_end"] = sub.get("current_period_end") or 0
+
+    # Fire the welcome email exactly once — the first time a user transitions
+    # to a paying/trialing state. We stamp welcome_sent_at so we never re-send
+    # on later Stripe update events (which fire every time anything changes).
+    if new_status in ("trialing", "active") and not u.get("subscription_welcome_sent_at"):
+        try:
+            import time as _time
+            from email_service import send_subscription_welcome
+            plan_label = (sub.get("metadata") or {}).get("reelcrate_plan", "").capitalize()
+            plan_label = f"Reelcrate {plan_label}" if plan_label else "Reelcrate"
+            # For trials we prefer trial_end; for direct activations we use
+            # current_period_end so the "first bill" line still makes sense.
+            trial_end = sub.get("trial_end") or sub.get("current_period_end") or 0
+            send_subscription_welcome(
+                to=email,
+                name=u.get("name", ""),
+                plan_label=plan_label,
+                trial_end_epoch=int(trial_end) if trial_end else 0,
+                is_trialing=(new_status == "trialing"),
+            )
+            u["subscription_welcome_sent_at"] = int(_time.time())
+        except Exception as e:
+            print(f"[billing] welcome email failed for {email}: {e}")
+
     _save_users(users)
 
 
