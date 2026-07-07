@@ -142,6 +142,44 @@ def send_waitlist_welcome(to: str, name: str = "") -> bool:
                       _wrap(title, body, _btn("Open reelcrate.app →", APP_URL)))
 
 
+def send_subscription_welcome(to: str, name: str = "", plan_label: str = "",
+                              trial_end_epoch: int = 0, is_trialing: bool = True) -> bool:
+    """Sent the first time a user transitions to trialing/active on Stripe.
+    Confirms the trial started + tells them the next billing date."""
+    import datetime as _dt
+    next_bill = ""
+    if trial_end_epoch:
+        try:
+            d = _dt.datetime.utcfromtimestamp(int(trial_end_epoch))
+            next_bill = d.strftime("%b %d, %Y")
+        except Exception:
+            next_bill = ""
+
+    plan = plan_label or "Reelcrate"
+    title = "You're in — trial started" if is_trialing else "You're subscribed"
+    parts = [f'Hey {name or "DJ"} —<br><br>',
+             (f'Your <b>{plan}</b> free trial is live. '
+              f'You have full access to Reelcrate right now — upload sets, '
+              f'pick BPM ranges, get 5 ready-to-post clips in ~3 minutes.<br><br>'
+              if is_trialing else
+              f'Your <b>{plan}</b> subscription is active. Thanks for backing Reelcrate.<br><br>')]
+    if is_trialing and next_bill:
+        parts.append(f'<b>First bill:</b> {next_bill} — you can cancel any time before then '
+                     f'from Settings → Manage subscription and you won\'t be charged.<br><br>')
+    parts.append(
+        '<b>What to do first:</b><br>'
+        '&nbsp;• Sign in at <a href="' + APP_URL + '/app/" style="color:#f5c518">reelcrate.app/app</a><br>'
+        '&nbsp;• Upload your most recent set (video or audio, up to 4 hrs)<br>'
+        '&nbsp;• Pick a BPM range that matches the section you want to clip<br>'
+        '&nbsp;• Post the clips to Reels / TikTok / Shorts<br><br>'
+        '— DJ EZ1 (founder)'
+    )
+    body = "".join(parts)
+    subject = f"Your Reelcrate trial is live" if is_trialing else "Welcome to Reelcrate"
+    return send_email(to, subject,
+                      _wrap(title, body, _btn("Open Reelcrate →", APP_URL + "/app/")))
+
+
 def send_waitlist_alert(to_admin: str, submitter_email: str, name: str = "") -> bool:
     """Alerts the founder inbox that a new DJ joined the waitlist."""
     title = "New waitlist signup"
