@@ -32,6 +32,118 @@ WHITE = "0xFFFFFF"
 W, H = 1080, 1920  # 9:16 vertical
 FPS = 30
 
+
+# ----------------- Face-aware smart crop ---------------------------------
+#
+# When we cut a 9:16 window out of a landscape video, a naive center crop
+# slices off whoever is standing to one side of frame — DJs behind the
+# booth, dancers in the corner, reactions on the flank. This helper
+# samples a few frames across the clip window, runs a Haar cascade face
+# detector, and returns a horizontal center-of-interest in the range
+# 0..1 so ffmpeg can crop toward it. Falls back to 0.5 (dead center)
+# whenever OpenCV is unavailable or no faces show up.
+
+_FACE_CASCADE = None
+
+def _get_face_cascade():
+    global _FACE_CASCADE
+    if _FACE_CASCADE is not None:
+        return _FACE_CASCADE
+    try:
+        import cv2
+        path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+        _FACE_CASCADE = cv2.CascadeClassifier(path)
+        if _FACE_CASCADE.empty():
+            _FACE_CASCADE = None
+    except Exception as e:
+        print(f"    [smart-crop] cv2 unavailable: {e}")
+        _FACE_CASCADE = None
+    return _FACE_CASCADE
+
+
+def _find_face_center_x(source: str, start: float, duration: float,
+                        src_w: int, src_h: int) -> float:
+    """Return 0..1 giving the horizontal center-of-interest for a 9:16 crop.
+
+    Samples 5 frames from within [start, start+duration], runs face
+    detection, weights each hit by the box area (bigger faces = more
+    important), then averages. Returns 0.5 if nothing found.
+    """
+    cascade = _get_face_cascade()
+    if cascade is None:
+        return 0.5
+
+    # If the source is already portrait or square, a horizontal shift buys
+    # us nothing — the crop is already the full width.
+    if src_w <= 0 or src_h <= 0 or src_w * 16 <= src_h * 9:
+        return 0.5
+
+    import cv2
+    import numpy as np
+
+    n_samples = 5
+    # Sample points spread across the interior of the window (avoid start
+    # and end edges where the DJ may be walking on/off).
+    if duration <= 1.0:
+        ts = [start + duration / 2]
+    else:
+        step = duration / (n_samples + 1)
+        ts = [start + step * (i + 1) for i in range(n_samples)]
+
+    total_wx = 0.0
+    total_w = 0.0
+
+    for t in ts:
+        # Grab a single JPEG frame via ffmpeg at time t. Downscale to
+        # 640 wide to keep detection fast.
+        try:
+            proc = subprocess.run(
+                ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                 "-ss", f"{t:.2f}", "-i", source,
+                 "-frames:v", "1", "-vf", "scale=640:-2",
+                 "-f", "image2pipe", "-vcodec", "mjpeg", "-"],
+                capture_output=True, timeout=8
+            )
+            buf = proc.stdout
+            if not buf:
+                continue
+            arr = np.frombuffer(buf, dtype=np.uint8)
+            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if img is None:
+                continue
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            gray = cv2.equalizeHist(gray)
+            faces = cascade.detectMultiScale(
+                gray, scaleFactor=1.15, minNeighbors=4,
+                minSize=(40, 40),
+            )
+            fh, fw = gray.shape[:2]
+            for (x, y, w, h) in faces:
+                # Weight by area — a big DJ face matters more than a
+                # tiny background one — and by centrality on Y (skip
+                # ceiling / floor false-positives).
+                area = float(w * h)
+                cy = (y + h / 2) / fh
+                y_weight = 1.0 - abs(cy - 0.45) * 1.2  # peak near eye-line
+                y_weight = max(0.15, y_weight)
+                weight = area * y_weight
+                cx = (x + w / 2) / fw
+                total_wx += cx * weight
+                total_w += weight
+        except Exception as e:
+            print(f"    [smart-crop] sample at {t:.1f}s failed: {e}")
+            continue
+
+    if total_w <= 0:
+        return 0.5
+
+    fx = total_wx / total_w
+    # Don't shove the crop all the way to the edge — clamp to a
+    # reasonable interior band so we never lose half the frame.
+    fx = max(0.15, min(0.85, fx))
+    print(f"    [smart-crop] face_x_frac={fx:.3f} from {int(total_w)} weighted hits")
+    return fx
+
 # Visualizer styles, cycled by clip rank so each clip in a batch gets a different look.
 # Each style returns an ffmpeg filter chain that produces a [wave] labeled output,
 # 1080 wide x configurable height, ready to overlay on the video background.
@@ -142,10 +254,14 @@ def render_clip(source: str, clip: dict, out_path: str, watermark: str,
         f"alpha=0.85"
     )
 
-    # Tag chip (top-right) — slightly smaller too, balanced with the logo
+    # Tag chip — moved to BOTTOM-LEFT, sitting just above the watermark.
+    # This gets it out of the top-right where lots of DJ set videos have their
+    # own title graphics burned in ("XYZ Watch Party", promoter logos, etc.)
+    # which visually collided with our yellow chip. Bottom-left is empty
+    # airspace and the chip stacks cleanly on top of the @handle watermark.
     text_filters.append(
         f"drawtext=fontfile={FONT_BOLD}:text='{safe_tag}':fontcolor=black:"
-        f"fontsize=32:x=w-tw-40:y=46:box=1:boxcolor={YELLOW}:boxborderw=12"
+        f"fontsize=28:x=40:y=h-130:box=1:boxcolor={YELLOW}:boxborderw=10"
     )
 
     # BPM (bottom-right) — small, above the caption area so it doesn't collide
@@ -197,13 +313,29 @@ def render_clip(source: str, clip: dict, out_path: str, watermark: str,
         )
 
     # ---------- Construct video base ----------
-    # Probe for video stream presence
+    # Probe for video stream presence AND get the source dimensions so we can
+    # ask OpenCV to find faces at the right coordinates.
     probe = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v",
-         "-show_entries", "stream=codec_type", "-of", "default=nw=1:nk=1", source],
+         "-show_entries", "stream=codec_type,width,height",
+         "-of", "default=nw=1", source],
         capture_output=True, text=True
     )
     has_video = "video" in probe.stdout
+    src_w = src_h = 0
+    for line in (probe.stdout or "").splitlines():
+        if line.startswith("width="):  src_w = int(line.split("=", 1)[1] or 0)
+        if line.startswith("height="): src_h = int(line.split("=", 1)[1] or 0)
+
+    # If we have a landscape video, run face detection on 3-5 sample frames
+    # and figure out where the crowd/DJ/dancers are. Falls back to center if
+    # no faces found or if OpenCV isn't installed.
+    face_x_frac = 0.5  # 0..1 horizontal center of interest in source frame
+    if has_video and src_w > 0 and src_h > 0:
+        try:
+            face_x_frac = _find_face_center_x(source, start, duration, src_w, src_h)
+        except Exception as e:
+            print(f"    [smart-crop] face detection failed, using center: {e}")
 
     # Always split the audio stream: one copy for the foreground waveform,
     # one copy for the fullscreen backdrop (or drained, if the source has video).
@@ -212,11 +344,18 @@ def render_clip(source: str, clip: dict, out_path: str, watermark: str,
     if has_video:
         # Scale-and-crop the source video to 9:16. Use scale=-2:H to size by height
         # (works for landscape sources where we'd otherwise underfill), force_original
-        # ensures we always have enough pixels in both directions, then crop center.
+        # ensures we always have enough pixels in both directions, then crop
+        # centered on face_x_frac so DJs / dancers / reactions stay in frame
+        # instead of getting sliced by a naive center crop.
+        # crop x expression: horizontal offset into the SCALED source's width
+        # is (scaled_w * face_x_frac) - W/2, then clamped to 0..(scaled_w - W).
+        crop_x_expr = (
+            f"max(0,min(iw-{W},iw*{face_x_frac:.4f}-{W}/2))"
+        )
         video_chain = (
             f"{audio_split}"
             f"[0:v]scale=w='if(gt(a,{W}/{H}),-2,{W})':h='if(gt(a,{W}/{H}),{H},-2)',"
-            f"crop={W}:{H}:(iw-{W})/2:(ih-{H})/2,"
+            f"crop={W}:{H}:{crop_x_expr}:(ih-{H})/2,"
             f"setsar=1,"
             f"eq=brightness=-0.05:saturation=1.1[bg];"
             # [abg] is unused in the has_video branch — anullsink drains it.

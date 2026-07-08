@@ -374,6 +374,9 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
     # BPM either pass or fail the genre check erroneously.
     GENRE_MATCH_MIN_CONF = 0.30
 
+    # Frames per second (of analysis grid) used below for flux windowing.
+    frames_per_sec = 1.0 / frame_sec
+
     candidates_with_meta = []
     for frame, sc in ranked_candidates:
         peak_sec = float(frame * frame_sec)
@@ -394,9 +397,25 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
         else:
             matches = _bpm_in_range(local_bpm, eff_lo, eff_hi)
 
+        # Flux sustain — real DJ transitions have SUSTAINED spectral change
+        # over 5–10s (a mix window). In-track drops spike then decay in <2s.
+        # Compare flux around the peak to flux 8–15s before it: if elevated
+        # persists, it's a mix; if it's a spike, it's a drop.
+        pre_lo  = max(0, frame - int(15 * frames_per_sec))
+        pre_hi  = max(0, frame - int(8  * frames_per_sec))
+        mid_lo  = max(0, frame - int(3  * frames_per_sec))
+        mid_hi  = min(len(flux_smooth), frame + int(7 * frames_per_sec))
+        try:
+            baseline = float(np.mean(flux_smooth[pre_lo:pre_hi])) if pre_hi > pre_lo else 0.0
+            sustain  = float(np.mean(flux_smooth[mid_lo:mid_hi])) if mid_hi > mid_lo else 0.0
+            flux_sustain = max(0.0, sustain - baseline)
+        except Exception:
+            flux_sustain = 0.0
+
         candidates_with_meta.append({
             "frame": frame, "score": sc, "peak_sec": peak_sec,
             "local_bpm": local_bpm, "local_bpm_confidence": local_conf,
+            "flux_sustain": flux_sustain,
             "genre_match": matches,
         })
 
@@ -432,9 +451,64 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
                   f"{eff_hi:.0f}] BPM; padding with {num_clips - len(matching)} best overall.")
             fallback_used = True
 
-    # Minimum spacing between picked clips — prevents 5 near-identical moments
-    # from the same 3-minute section of the set.
-    MIN_PICK_GAP_SEC = 90.0
+    # Minimum spacing between picked clips — bumped from 90s to 180s because
+    # 90s wasn't enough on dense sets (multiple drops per section clustered).
+    MIN_PICK_GAP_SEC = 180.0
+
+    # -------- Zone-based spread --------
+    # Divide the whole set into num_clips equal zones and prefer picking ONE
+    # candidate per zone. This guarantees clips are spread across the set even
+    # when energy is heavily front-loaded or back-loaded. Fall back to relaxed
+    # picking if a zone is empty.
+    def _zone_of(peak_sec: float, n_zones: int, total_dur: float) -> int:
+        if total_dur <= 0 or n_zones <= 0:
+            return 0
+        z = int((peak_sec / total_dur) * n_zones)
+        return max(0, min(n_zones - 1, z))
+
+    def _pick_by_zones(pool: list[dict], k: int, total_dur: float, seed: int,
+                       already_picked: list[dict] | None = None) -> list[dict]:
+        """Split the timeline into k zones. In each zone, pick the top candidate
+        (or a weighted-random one if seed is set). Zones with no candidate get
+        filled at the end from the pool's remaining best."""
+        if k <= 0 or not pool:
+            return []
+        picked = list(already_picked or [])
+        picked_keys = {id(c) for c in picked}
+        by_zone: dict[int, list[dict]] = {}
+        for c in pool:
+            if id(c) in picked_keys:
+                continue
+            z = _zone_of(c["peak_sec"], k, total_dur)
+            by_zone.setdefault(z, []).append(c)
+
+        out: list[dict] = []
+        rng = None
+        if seed:
+            import random as _random
+            rng = _random.Random(int(seed))
+
+        for z in range(k):
+            candidates = sorted(by_zone.get(z, []), key=lambda c: -c["score"])
+            if not candidates:
+                continue
+            if rng and len(candidates) > 1:
+                top = candidates[:max(3, min(len(candidates), 5))]
+                weights = [max(0.01, float(c["score"])) for c in top]
+                pick = rng.choices(top, weights=weights, k=1)[0]
+            else:
+                pick = candidates[0]
+            out.append(pick)
+
+        # Fill leftover slots from zones that had extras (top of any zone).
+        remaining = [c for c in pool if id(c) not in {id(x) for x in out + picked}]
+        remaining.sort(key=lambda c: -c["score"])
+        for c in remaining:
+            if len(out) >= k:
+                break
+            out.append(c)
+
+        return out
 
     def _pick_from_pool(pool: list[dict], k: int, seed: int,
                         already_picked: list[dict] | None = None) -> list[dict]:
@@ -492,16 +566,27 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
                         out.append(c)
             return out
 
-    selected = _pick_from_pool(primary_pool, num_clips, variation_seed)
+    # Prefer zone-based picking on the primary pool — this GUARANTEES clips
+    # come from different sections of the set. Only fall back to the
+    # score-based picker (still with 180s spacing) if we don't have enough
+    # zones populated.
+    selected = _pick_by_zones(primary_pool, num_clips, duration, variation_seed)
     remaining_slots = num_clips - len(selected)
     if remaining_slots > 0 and secondary_pool:
-        # Use a slightly different seed for the secondary pool so the same
-        # positions in the two pools don't collide on identical picks. Pass
-        # the primary picks in as `already_picked` so the spacing filter also
-        # spreads secondary picks away from primary ones.
-        selected += _pick_from_pool(
-            secondary_pool, remaining_slots,
+        # Fill leftover slots from the secondary pool, spread across zones too.
+        selected += _pick_by_zones(
+            secondary_pool, remaining_slots, duration,
             variation_seed + 1 if variation_seed else 0,
+            already_picked=selected,
+        )
+    # Final safety net — if zones can't fill the target (e.g. tiny set), fall
+    # back to the classic weighted picker with 180s spacing.
+    remaining_slots = num_clips - len(selected)
+    if remaining_slots > 0:
+        pool_all = primary_pool + secondary_pool
+        selected += _pick_from_pool(
+            pool_all, remaining_slots,
+            variation_seed + 2 if variation_seed else 0,
             already_picked=selected,
         )
     selected.sort(key=lambda c: c["frame"])
@@ -528,6 +613,7 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
             "score": round(float(c["score"]), 4),
             "energy": round(float(rms_smooth[frame]), 4),
             "flux": round(float(flux_smooth[frame]), 4),
+            "flux_sustain": round(float(c.get("flux_sustain") or 0), 4),
             "bpm": round(global_bpm, 1),
             "bpm_confidence": round(global_conf, 2),
             "local_bpm": round(c["local_bpm"], 1),
@@ -597,12 +683,24 @@ HOOK_POOL = {
 
 
 def _resolve_tag(c: dict) -> str:
-    energy = c["energy"]
-    flux = c["flux"]
+    """Assign a tag that actually reflects what's happening in the audio.
+
+    Prior version tagged anything with a flux spike as TRANSITION, so 90 % of
+    in-track drops got mislabeled. Real DJ transitions have SUSTAINED spectral
+    change over a mix window (5-10s) — captured in `flux_sustain`, which is
+    the elevation of flux at the peak relative to 8-15s earlier.
+    """
+    energy   = c.get("energy", 0) or 0
+    flux     = c.get("flux", 0) or 0
+    sustain  = c.get("flux_sustain", 0) or 0
+
+    # Sustain >= 0.15 means the spectrum stayed noticeably different from a
+    # baseline 8-15s earlier — that's a real mix, not a snare hit.
+    if sustain >= 0.15 and flux >= 0.55:
+        return "TRANSITION"
+    # PEAK = high energy + high flux at the moment. In-track drops land here.
     if flux > 0.75 and energy > 0.65:
         return "PEAK"
-    if flux > 0.65:
-        return "TRANSITION"
     if energy > 0.75:
         return "BUILD"
     if energy > 0.5:
