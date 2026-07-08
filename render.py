@@ -342,20 +342,30 @@ def render_clip(source: str, clip: dict, out_path: str, watermark: str,
     audio_split = "[0:a]asplit=2[abg][amain];"
 
     if has_video:
-        # Scale-and-crop the source video to 9:16. Use scale=-2:H to size by height
-        # (works for landscape sources where we'd otherwise underfill), force_original
-        # ensures we always have enough pixels in both directions, then crop
-        # centered on face_x_frac so DJs / dancers / reactions stay in frame
-        # instead of getting sliced by a naive center crop.
-        # crop x expression: horizontal offset into the SCALED source's width
-        # is (scaled_w * face_x_frac) - W/2, then clamped to 0..(scaled_w - W).
-        crop_x_expr = (
-            f"max(0,min(iw-{W},iw*{face_x_frac:.4f}-{W}/2))"
-        )
+        # Scale-and-crop the source video to 9:16 centered on face_x_frac.
+        #
+        # Compute the crop offset as a LITERAL INTEGER in Python rather than
+        # an ffmpeg expression. The previous version used
+        #   crop=1080:1920:max(0,min(iw-1080,iw*0.841-540)):(ih-1920)/2
+        # which broke because the outer filter_complex parser reads unescaped
+        # commas as filter separators — nested `,` inside min()/max() made
+        # ffmpeg lose the plot and error out with `Filter not found`.
+        # Since we know src_w / src_h from ffprobe, we can figure out exactly
+        # what the scaled width will be and hand ffmpeg a bare integer.
+        if src_w > 0 and src_h > 0 and src_w * H > src_h * W:
+            # Landscape: scale=-2:H (height fixed at H, width scales up).
+            scaled_w = int(round(src_w * H / src_h))
+            if scaled_w % 2:                # -2 rounds to even
+                scaled_w -= 1
+            target_x  = int(scaled_w * face_x_frac)
+            crop_x_px = max(0, min(scaled_w - W, target_x - W // 2))
+        else:
+            # Portrait / square: scale to W wide → no horizontal shift possible.
+            crop_x_px = 0
         video_chain = (
             f"{audio_split}"
             f"[0:v]scale=w='if(gt(a,{W}/{H}),-2,{W})':h='if(gt(a,{W}/{H}),{H},-2)',"
-            f"crop={W}:{H}:{crop_x_expr}:(ih-{H})/2,"
+            f"crop={W}:{H}:{crop_x_px}:(ih-{H})/2,"
             f"setsar=1,"
             f"eq=brightness=-0.05:saturation=1.1[bg];"
             # [abg] is unused in the has_video branch — anullsink drains it.
