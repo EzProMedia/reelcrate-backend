@@ -5,7 +5,6 @@ Endpoints:
   POST   /api/upload            Upload a DJ set, returns job_id
   GET    /api/jobs/{job_id}     Get processing status + progress + clip URLs
   GET    /api/clips/{job_id}/{filename}   Serve a clip MP4
-  POST   /api/waitlist          Landing-page CLAIM SPOT form
   GET    /healthz               Health check
 
 Run locally:
@@ -146,7 +145,8 @@ def emergency_cleanup() -> None:
 async def process_job(job_id: str, source_path: Path, genre: str,
                       visualizer: str, num_clips: int, clip_length: int,
                       watermark: str, variation_seed: int = 0,
-                      bpm_min: float = 0, bpm_max: float = 0) -> None:
+                      bpm_min: float = 0, bpm_max: float = 0,
+                      hide_logo: bool = False) -> None:
     """Run analyze + render in a worker thread. Updates job state as it goes."""
     out_dir = job_dir(job_id)
     state = read_state(job_id) or {}
@@ -253,6 +253,7 @@ async def process_job(job_id: str, source_path: Path, genre: str,
                     lambda picked=_pick_source(): render_clip(
                         picked[0], lc if picked[1] else c,
                         p, watermark, visualizer,
+                        hide_logo=hide_logo,
                     )
                 )(),
             )
@@ -318,6 +319,7 @@ async def upload(
     variation_seed: int = Form(0),               # 0 = deterministic; >0 = randomize picks
     bpm_min: float = Form(0),                    # explicit BPM range (preferred over genre)
     bpm_max: float = Form(0),
+    hide_logo: bool = Form(False),               # paid-tier-only; enforced below
     user_email: str = Depends(current_user),     # gated: sign-in required
 ):
     # Verified-email gate (signup is allowed but upload requires verification).
@@ -331,6 +333,16 @@ async def upload(
         raise HTTPException(403, "Please verify your email before uploading. Check your inbox.")
     if not is_paying(user_email):
         raise HTTPException(402, "Start your free trial to upload sets — reelcrate.app/app → Upgrade")
+
+    # Watermark toggle gate: hide_logo is a paid-tier-only perk. Trial users
+    # (subscription_status == "trialing") always get the REEL/CRATE watermark
+    # baked in as free-tier marketing exposure. Only "active" subscribers can
+    # remove it. We silently coerce rather than 4xx so the frontend can send
+    # the flag optimistically and let the backend do the enforcement.
+    if hide_logo:
+        _sub_status = (users.get(user_email, {}) or {}).get("subscription_status")
+        if _sub_status != "active":
+            hide_logo = False
     # The frontend can send an explicit bpm_min/bpm_max range and any string
     # for genre (used as a display label). Only reject an unknown genre if
     # NO explicit BPM range was provided AND the genre isn't a known preset.
@@ -389,6 +401,7 @@ async def upload(
         "visualizer": visualizer,
         "num_clips": num_clips,
         "clip_length": clip_length,
+        "hide_logo": hide_logo,
         "started_at": time.time(),
         "owner_email": user_email,
     }
@@ -402,6 +415,7 @@ async def upload(
         job_id, source_path, genre, visualizer, num_clips, clip_length, watermark,
         variation_seed=variation_seed,
         bpm_min=bpm_min, bpm_max=bpm_max,
+        hide_logo=hide_logo,
     ))
 
     return JSONResponse({"job_id": job_id, "status_url": f"/api/jobs/{job_id}"})
@@ -419,6 +433,7 @@ class RerenderReq(BaseModel):
     caption: str
     visualizer: Optional[str] = None
     watermark: Optional[str] = None
+    hide_logo: Optional[bool] = None   # paid-tier only — enforced below
 
 
 @app.post("/api/clips/{job_id}/{rank}/rerender")
@@ -473,10 +488,25 @@ async def rerender_clip(job_id: str, rank: int, req: RerenderReq,
     wm = req.watermark or state.get("watermark") or "@realdjez1"
     viz = req.visualizer or state.get("visualizer") or "freq_bars"
 
+    # Watermark toggle: default to whatever the original job used, override
+    # with req.hide_logo if the caller sent one. Then enforce the paid gate —
+    # only "active" subscribers can hide the REEL/CRATE logo.
+    hide_logo_req = req.hide_logo if req.hide_logo is not None else bool(state.get("hide_logo"))
+    if hide_logo_req:
+        import json as _json
+        from auth import USERS_FILE
+        try:
+            _users = _json.loads(USERS_FILE.read_text())
+        except Exception:
+            _users = {}
+        if (_users.get(user_email, {}) or {}).get("subscription_status") != "active":
+            hide_logo_req = False
+
     loop = asyncio.get_event_loop()
     ok = await loop.run_in_executor(
         None,
-        lambda: render_clip(source_for_render, local_clip, str(out_mp4), wm, viz),
+        lambda: render_clip(source_for_render, local_clip, str(out_mp4), wm, viz,
+                            hide_logo=hide_logo_req),
     )
     if not ok:
         raise HTTPException(500, "Re-render failed")

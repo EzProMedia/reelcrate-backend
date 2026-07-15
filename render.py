@@ -213,7 +213,15 @@ def ff_escape_text(s: str) -> str:
 
 
 def render_clip(source: str, clip: dict, out_path: str, watermark: str,
-                visualizer: str = "freq_bars") -> bool:
+                visualizer: str = "freq_bars",
+                hide_logo: bool = False) -> bool:
+    """Render a single 9:16 clip.
+
+    hide_logo: when True, skip the REEL/CRATE wordmark in the top-left. This
+    is a paid-tier perk — the caller (main.py) is responsible for verifying
+    the user has an active (not trialing) subscription before passing True.
+    Trial users always get hide_logo=False so the watermark stays visible.
+    """
     start = clip["start_sec"]
     end = clip["end_sec"]
     duration = end - start
@@ -247,12 +255,16 @@ def render_clip(source: str, clip: dict, out_path: str, watermark: str,
 
     text_filters = []
 
-    # Logo wordmark (top-left) — smaller, less dominating
-    text_filters.append(
-        f"drawtext=fontfile={FONT_BOLD}:text='REEL/CRATE':fontcolor={WHITE}:"
-        f"fontsize=30:x=40:y=44:shadowcolor=black@0.6:shadowx=2:shadowy=2:"
-        f"alpha=0.85"
-    )
+    # Logo wordmark (top-left) — free/trial tier keeps this baked in as
+    # marketing exposure. Paid ("active") subscribers can hide it via the
+    # upload UI toggle; main.py enforces the subscription gate before
+    # setting hide_logo=True here.
+    if not hide_logo:
+        text_filters.append(
+            f"drawtext=fontfile={FONT_BOLD}:text='REEL/CRATE':fontcolor={WHITE}:"
+            f"fontsize=30:x=40:y=44:shadowcolor=black@0.6:shadowx=2:shadowy=2:"
+            f"alpha=0.85"
+        )
 
     # Tag chip — moved to BOTTOM-LEFT, sitting just above the watermark.
     # This gets it out of the top-right where lots of DJ set videos have their
