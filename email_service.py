@@ -128,18 +128,28 @@ def send_reset_email(to: str, name: str, token: str) -> bool:
 
 
 def send_waitlist_welcome(to: str, name: str = "") -> bool:
-    """Sent to DJs who submit the CLAIM SPOT form on the landing page."""
-    title = "You're in. Welcome to the crate."
+    """Sent to DJs who submit the email form on the landing page. The app is
+    now live and taking cards — so this isn't really a waitlist anymore, it's
+    a delivery mechanism for the FOUNDER40 code + a nudge to try the app.
+    Kept the function name for backwards compatibility with existing callers."""
+    title = "Your Reelcrate founder code is inside."
     body = (f'Hey {name or "DJ"} —<br><br>'
-            f'You\'re on the Reelcrate early-access list. Free for the first 50 DJs, '
-            f'no card needed, and we\'ll send your access link the day it goes live.<br><br>'
-            f'<b>What Reelcrate does:</b> you drop a set (audio or video), pick a BPM range and a visualizer, '
-            f'and we cut it into 5 ready-to-post 9:16 clips with captions baked in — Reels, TikTok, Shorts.<br><br>'
-            f'<b>While you wait:</b> follow <a href="https://instagram.com/reelcrateapp" style="color:#f5c518">@reelcrateapp</a> '
-            f'for build updates and drops.<br><br>'
+            f'Reelcrate is live and you\'re one of the first 40 DJs eligible for the '
+            f'founder deal: <b>$9.50/mo forever</b> (half off the regular $19/mo, locked in for life).<br><br>'
+            f'<b>Your code:</b> '
+            f'<span style="display:inline-block;background:#f5c518;color:#000;padding:6px 12px;'
+            f'border-radius:6px;font-weight:900;letter-spacing:.08em;font-size:15px">FOUNDER40</span><br><br>'
+            f'<b>How to redeem:</b><br>'
+            f'&nbsp;1. Tap the button below → sign up with this email<br>'
+            f'&nbsp;2. Start your 14-day free trial (no card charged for 14 days)<br>'
+            f'&nbsp;3. At Stripe checkout, enter <b>FOUNDER40</b> in the promo field<br>'
+            f'&nbsp;4. You\'re locked in at $9.50/mo for life<br><br>'
+            f'<b>What Reelcrate does:</b> drop a set (audio or video, up to 4 hrs), pick a BPM range and a visualizer, '
+            f'and we cut it into 5 ready-to-post 9:16 clips with captions baked in — Reels, TikTok, Shorts. About 3 minutes end-to-end.<br><br>'
+            f'<b>Heads up:</b> only 40 founder spots. Once they\'re gone, the code expires and it\'s regular pricing from there.<br><br>'
             f'— DJ EZ1 (founder)')
-    return send_email(to, "You're on the Reelcrate list ✓",
-                      _wrap(title, body, _btn("Open reelcrate.app →", APP_URL)))
+    return send_email(to, "Your Reelcrate founder code (FOUNDER40) is inside",
+                      _wrap(title, body, _btn("Claim your spot →", APP_URL + "/app/?promo=FOUNDER40")))
 
 
 def send_subscription_welcome(to: str, name: str = "", plan_label: str = "",
