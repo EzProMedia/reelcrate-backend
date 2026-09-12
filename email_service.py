@@ -31,7 +31,7 @@ def send_email(to: str, subject: str, html: str, text: Optional[str] = None) -> 
     """Send an email via Resend. Returns True on success. Never throws on network errors."""
     if not RESEND_API_KEY:
         print(f"[email] (no RESEND_API_KEY — would send) to={to} subject={subject!r}")
-        return True
+        return False
 
     body = {
         "from":    FROM_ADDRESS,

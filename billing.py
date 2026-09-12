@@ -17,6 +17,7 @@ User record additions:
 upload gate in main.py.
 """
 
+import asyncio
 import json
 import os
 import time
@@ -24,7 +25,8 @@ from typing import Optional
 
 import stripe
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from reliability import queue_email
 
 from auth import current_user, _load_users, _save_users
 
@@ -71,7 +73,7 @@ def _billing_public(u: dict) -> dict:
     }
 
 
-def _get_or_create_customer(email: str, name: str = "") -> str:
+async def _get_or_create_customer(email: str, name: str = "") -> str:
     """Fetch existing Stripe customer id or create one, and cache it on the user."""
     users = _load_users()
     u = users.get(email)
@@ -80,11 +82,14 @@ def _get_or_create_customer(email: str, name: str = "") -> str:
     cid = u.get("stripe_customer_id")
     if cid:
         return cid
-    customer = stripe.Customer.create(
+    customer = await asyncio.to_thread(stripe.Customer.create,
         email=email,
         name=name or u.get("name", ""),
         metadata={"reelcrate_email": email},
+        idempotency_key="customer:" + email,
     )
+    users = _load_users()
+    u = users[email]
     u["stripe_customer_id"] = customer.id
     _save_users(users)
     return customer.id
@@ -92,8 +97,27 @@ def _get_or_create_customer(email: str, name: str = "") -> str:
 
 # -------------------- routes --------------------
 
+def _resolve_promotion_code(code: str) -> Optional[str]:
+    """Turn a customer-facing promo code string (e.g. 'FOUNDER40') into its
+    Stripe promotion_code id ('promo_...'), or None if it isn't a currently
+    valid, active code. Never raises — a bad/expired code just falls through to
+    the manual promo field at checkout."""
+    code = (code or "").strip()
+    if not code:
+        return None
+    try:
+        found = stripe.PromotionCode.list(code=code, active=True, limit=1)
+        data = found.get("data") if isinstance(found, dict) else found.data
+        if data:
+            return data[0]["id"] if isinstance(data[0], dict) else data[0].id
+    except Exception as e:
+        print(f"[billing] promo resolve failed for {code!r}: {e}")
+    return None
+
+
 class CheckoutReq(BaseModel):
-    plan: str = "monthly"   # "monthly" or "yearly"
+    plan: str = "monthly"          # "monthly" or "yearly"
+    promo: Optional[str] = Field(default=None, max_length=100)    # optional promo code to auto-apply (e.g. FOUNDER40)
 
 
 @router.post("/checkout")
@@ -110,9 +134,9 @@ async def checkout(req: CheckoutReq = CheckoutReq(), email: str = Depends(curren
     if not u.get("verified"):
         raise HTTPException(403, "Please verify your email before subscribing")
 
-    customer_id = _get_or_create_customer(email, u.get("name", ""))
+    customer_id = await _get_or_create_customer(email, u.get("name", ""))
 
-    session = stripe.checkout.Session.create(
+    session_kwargs = dict(
         mode="subscription",
         customer=customer_id,
         line_items=[{"price": price_id, "quantity": 1}],
@@ -120,11 +144,34 @@ async def checkout(req: CheckoutReq = CheckoutReq(), email: str = Depends(curren
             "trial_period_days": TRIAL_DAYS,
             "metadata": {"reelcrate_email": email, "reelcrate_plan": req.plan},
         },
-        allow_promotion_codes=True,
         success_url=f"{APP_URL}/app/?checkout=success&session_id={{CHECKOUT_SESSION_ID}}",
         cancel_url =f"{APP_URL}/app/?checkout=cancel",
     )
-    return {"url": session.url, "session_id": session.id}
+
+    # Auto-apply a promo code (e.g. the ?promo=FOUNDER40 deep link) when one is
+    # supplied and resolves to a live Stripe promotion code. Stripe rejects
+    # `discounts` and `allow_promotion_codes` together, so it's one or the other:
+    #   - valid promo  -> pre-fill the discount, no manual field needed
+    #   - no/bad promo -> show the manual promo field so it can still be typed
+    promo_id = await asyncio.to_thread(_resolve_promotion_code, req.promo) if req.promo else None
+    applied_promo = None
+    if promo_id:
+        session_kwargs["discounts"] = [{"promotion_code": promo_id}]
+        applied_promo = (req.promo or "").strip().upper()
+    else:
+        session_kwargs["allow_promotion_codes"] = True
+
+    try:
+        session = await asyncio.to_thread(stripe.checkout.Session.create, **session_kwargs)
+    except stripe.error.InvalidRequestError as exc:
+        # Only retry a rejected discount; never hide unrelated payment errors.
+        if not promo_id or not str(getattr(exc, 'param', '') or '').startswith(('discounts', 'promotion_code')):
+            raise HTTPException(502, "Checkout could not be opened. Please try again.") from exc
+        session_kwargs.pop('discounts', None)
+        session_kwargs['allow_promotion_codes'] = True
+        applied_promo = None
+        session = await asyncio.to_thread(stripe.checkout.Session.create, **session_kwargs)
+    return {"url": session.url, "session_id": session.id, "promo_applied": applied_promo}
 
 
 @router.post("/portal")
@@ -136,7 +183,7 @@ async def portal(email: str = Depends(current_user)):
     cid = u.get("stripe_customer_id")
     if not cid:
         raise HTTPException(400, "No Stripe customer yet — start a subscription first")
-    session = stripe.billing_portal.Session.create(
+    session = await asyncio.to_thread(stripe.billing_portal.Session.create,
         customer=cid,
         return_url=f"{APP_URL}/app/",
     )
@@ -175,7 +222,9 @@ def _apply_subscription(sub: dict):
     new_status = sub.get("status")
     u["subscription_id"] = sub.get("id")
     u["subscription_status"] = new_status
-    u["subscription_current_period_end"] = sub.get("current_period_end") or 0
+    period_end = sub.get("current_period_end") or sub.get("trial_end") or max(
+        (item.get("current_period_end") or 0 for item in (sub.get("items") or {}).get("data", [])), default=0)
+    u["subscription_current_period_end"] = period_end
 
     # Fire the welcome email exactly once — the first time a user transitions
     # to a paying/trialing state. We stamp welcome_sent_at so we never re-send
@@ -188,8 +237,9 @@ def _apply_subscription(sub: dict):
             plan_label = f"Reelcrate {plan_label}" if plan_label else "Reelcrate"
             # For trials we prefer trial_end; for direct activations we use
             # current_period_end so the "first bill" line still makes sense.
-            trial_end = sub.get("trial_end") or sub.get("current_period_end") or 0
-            send_subscription_welcome(
+            trial_end = sub.get("trial_end") or period_end or 0
+            queue_email(send_subscription_welcome,
+                delivery_id="subscription-welcome:" + email,
                 to=email,
                 name=u.get("name", ""),
                 plan_label=plan_label,
@@ -208,11 +258,7 @@ async def webhook(request: Request):
     payload = await request.body()
     sig = request.headers.get("Stripe-Signature", "")
     if not STRIPE_WEBHOOK_SECRET:
-        # In dev, accept parsed JSON directly so we can test without a webhook secret.
-        try:
-            event = json.loads(payload.decode())
-        except Exception:
-            raise HTTPException(400, "invalid payload")
+        raise HTTPException(503, "Payment webhook is not configured")
     else:
         try:
             event = stripe.Webhook.construct_event(
@@ -240,9 +286,9 @@ async def webhook(request: Request):
         sub_id = obj.get("subscription")
         if sub_id:
             try:
-                sub = stripe.Subscription.retrieve(sub_id)
+                sub = await asyncio.to_thread(stripe.Subscription.retrieve, sub_id)
                 _apply_subscription(sub)
-            except Exception:
-                pass
+            except Exception as exc:
+                raise HTTPException(503, "Subscription update unavailable; retry delivery") from exc
 
     return {"received": True}

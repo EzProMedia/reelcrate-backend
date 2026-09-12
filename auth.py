@@ -22,6 +22,7 @@ Routes:
   POST /api/auth/resend       (Authorization)                → {ok: true}      (resend verification email)
 """
 
+import asyncio
 import io
 import json
 import os
@@ -49,8 +50,12 @@ DATA_ROOT  = Path(os.environ.get("REELCRATE_DATA", "/tmp/reelcrate"))
 DATA_ROOT.mkdir(parents=True, exist_ok=True)
 USERS_FILE = DATA_ROOT / "users.json"
 
-JWT_SECRET = os.environ.get("JWT_SECRET", "reelcrate-dev-secret-please-set-in-railway")
+DEFAULT_JWT_SECRET = "reelcrate-dev-secret-please-set-in-railway"
+JWT_SECRET = os.environ.get("JWT_SECRET", DEFAULT_JWT_SECRET)
 JWT_ALGO   = "HS256"
+
+if JWT_SECRET == DEFAULT_JWT_SECRET or len(JWT_SECRET.encode()) < 32:
+    raise RuntimeError("Set JWT_SECRET to a private random value of at least 32 bytes before starting")
 TOKEN_TTL          = 60 * 60 * 24 * 30   # 30 days for the real token
 MFA_TOKEN_TTL      = 60 * 10             # 10 min for the temp token between signin and MFA verify
 VERIFY_TOKEN_TTL   = 60 * 60 * 24        # 24 hours for email verification
@@ -69,13 +74,24 @@ def _load_users() -> dict:
         return {}
     try:
         return json.loads(USERS_FILE.read_text())
-    except Exception:
-        return {}
+    except Exception as exc:
+        raise RuntimeError("Account storage cannot be read; refusing to overwrite it") from exc
 
 
 def _save_users(users: dict) -> None:
     tmp = USERS_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(users, indent=2))
+    if USERS_FILE.exists():
+        # Preserve the last valid state before replacing it.
+        previous = USERS_FILE.read_text()
+        json.loads(previous)
+        backup = USERS_FILE.with_suffix('.json.bak')
+        backup.write_text(previous)
+        backup.chmod(0o600)
+    with tmp.open('w') as handle:
+        json.dump(users, handle, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    tmp.chmod(0o600)
     tmp.replace(USERS_FILE)
 
 
@@ -111,6 +127,9 @@ def verify_token(token: str, expect_kind: str = "session") -> Optional[str]:
 def random_token() -> str:
     """Short URL-safe token for reset/verify links."""
     return secrets.token_urlsafe(32)
+
+
+from reliability import queue_email as _fire_email, rate_limit
 
 
 # -------------------- user record helpers --------------------
@@ -167,6 +186,8 @@ class MfaDisableReq(BaseModel):
 def _validate_credentials(email: str, password: str):
     if not EMAIL_RE.match(email):
         raise HTTPException(400, "Please enter a valid email")
+    if len(password.encode()) > 72:
+        raise HTTPException(400, "Password must be at most 72 bytes")
     if len(password) < 8:
         raise HTTPException(400, "Password must be at least 8 characters")
 
@@ -197,7 +218,7 @@ async def signup(req: SignupReq):
     _save_users(users)
 
     # Fire-and-forget the verification email; sign-up succeeds even if email errors out.
-    send_verify_email(email, name, verify_tok)
+    _fire_email(send_verify_email, email, name, verify_tok)
 
     return {**_public(users[email]), "token": make_token(email)}
 
@@ -205,6 +226,7 @@ async def signup(req: SignupReq):
 @router.post("/signin")
 async def signin(req: SigninReq):
     email = req.email.strip().lower()
+    rate_limit("signin:" + email, 10)
     users = _load_users()
     u = users.get(email)
     if not u or not _check(req.password, u["password_hash"]):
@@ -222,6 +244,7 @@ async def mfa_verify(req: MfaVerifyReq):
     email = verify_token(req.mfa_token, expect_kind="mfa")
     if not email:
         raise HTTPException(401, "MFA challenge expired — sign in again")
+    rate_limit("mfa:" + email, 10)
     users = _load_users()
     u = users.get(email)
     if not u or not u.get("mfa_enabled") or not u.get("mfa_secret"):
@@ -281,7 +304,7 @@ async def resend_verify(email: str = Depends(current_user)):
     u["verify_token"]     = tok
     u["verify_token_exp"] = int(time.time()) + VERIFY_TOKEN_TTL
     _save_users(users)
-    send_verify_email(email, u.get("name", ""), tok)
+    _fire_email(send_verify_email, email, u.get("name", ""), tok)
     return {"ok": True}
 
 
@@ -297,13 +320,15 @@ async def forgot(req: ForgotReq):
         u["reset_token"]     = tok
         u["reset_token_exp"] = int(time.time()) + RESET_TOKEN_TTL
         _save_users(users)
-        send_reset_email(email, u.get("name", ""), tok)
+        _fire_email(send_reset_email, email, u.get("name", ""), tok)
     # Always return 200 — don't leak whether the email is registered.
     return {"ok": True}
 
 
 @router.post("/reset")
 async def reset(req: ResetReq):
+    if len(req.password.encode()) > 72:
+        raise HTTPException(400, "Password must be at most 72 bytes")
     if len(req.password) < 8:
         raise HTTPException(400, "Password must be at least 8 characters")
     users = _load_users()

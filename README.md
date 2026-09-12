@@ -1,52 +1,36 @@
-# Reelcrate Backend
+# Reelcrate backend
 
-FastAPI service that turns a DJ set upload into 5–8 ready-to-post 9:16 clips.
+FastAPI DJ-set analysis and vertical-video rendering service. Production uses one worker and a persistent Railway volume mounted at `/data`.
 
-Wraps `analyze.py` + `render.py` (audio analysis via librosa + render via ffmpeg).
+## Configuration
 
-## Endpoints
+Set a private random `JWT_SECRET` of at least 32 bytes. Startup refuses missing, short, or public-default secrets. Preserve the existing valid production value to keep users signed in.
 
-| Method | Path | Purpose |
-|---|---|---|
-| GET  | `/healthz` | Liveness check |
-| POST | `/api/upload` | Upload a set, returns `job_id` |
-| GET  | `/api/jobs/{job_id}` | Job status + progress + clip URLs |
-| GET  | `/api/clips/{job_id}/{file}.mp4` | Serve a rendered clip |
+Admin routes require a separate `ADMIN_TOKEN` of at least 32 bytes, passed as `Authorization: Bearer …`. URL passwords and JWT-secret fallback are removed. Missing admin configuration disables admin routes only.
 
-### Upload form fields
+Keep `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_ID`, `STRIPE_PRICE_ID_YEAR`, `APP_URL`, `RESEND_API_KEY`, and `RESEND_FROM` configured in Railway. Webhooks refuse unsigned events if the webhook secret is missing. No pricing changes are included.
 
-| Field | Type | Default | Notes |
-|---|---|---|---|
-| `file` | file (audio/video) | required | Up to 2 GB, any format ffmpeg reads |
-| `genre` | string | `all` | One of `GENRE_BPM_RANGES` (see `engine/analyze.py`) |
-| `visualizer` | string | `freq_bars` | One of `VISUALIZER_STYLES` (see `engine/render.py`) |
-| `num_clips` | int | 5 | 1–12 |
-| `clip_length` | int | 30 | 10–90 (seconds) |
-| `watermark` | string | `@realdjez1` | Bottom-left overlay text |
+## September fixes
 
-## Local run
+- Applied the September patch, then strengthened its admin, email, and discount handling.
+- Email outbox persists on the data volume in SQLite, retries delivery failures, and clears sensitive payloads after success. Delivery is at least once: a crash after the provider accepts an email can still cause a duplicate. Run one worker.
+- Account writes are atomic, flushed, and preserve the previous valid file as `users.json.bak`. Corrupt account data fails visibly instead of becoming an empty account database. The backup is on the same volume; retain independent Railway backups for disaster recovery.
+- Persistent per-account and per-client attempt limits protect authentication routes.
+- Stripe network calls and clip-source extraction run off the event loop.
+- Job status requires its owner’s login; returned clip links carry scoped, six-hour tickets. Downloads support byte ranges and attachment filenames for phone playback and saving.
+- Cleanup runs periodically and skips unfinished jobs. One upload processes at a time to protect the small volume. Interrupted jobs become retryable failures after restart.
+- Checkout accepts an optional promo, looks it up, and uses either an applied discount or manual entry. A discount-specific checkout rejection falls back to manual entry.
 
-```bash
-pip install -r requirements.txt
-uvicorn main:app --reload --port 8080
-```
+## Frontend
 
-## Container
+The current frontend is deployed separately to the existing Netlify project. Its update preserves promo codes across verification, authenticates job polling, adds a home-screen manifest and icons, and improves phone downloads. Publish both halves together. Existing open browser tabs should reload after the backend update.
 
-```bash
-docker build -t reelcrate-backend .
-docker run -p 8080:8080 -v $PWD/data:/data reelcrate-backend
-```
+An optional `frontend/` folder in a local checkout is served at `/app/` for local checks. The production backend Docker image remains API-only.
 
-## Railway deploy
+## Validation
 
-1. Push this repo to GitHub
-2. Railway → New Project → Deploy from GitHub repo → select this repo
-3. Railway auto-detects the Dockerfile and builds
-4. Set env var `REELCRATE_DATA=/data` and attach a Volume mounted at `/data` for persistent clip storage
-5. Get the public URL (e.g. `https://reelcrate-backend.up.railway.app`)
-6. Point the frontend at that URL (set `BACKEND_URL` in the frontend JS)
+Install the requirements plus pytest and httpx, then run `pytest -q test_regressions.py`. Tests isolate storage and mock payment/email services; they never charge or contact customers. Full rendering additionally requires ffmpeg and the configured fonts. Tests are not a four-hour workload benchmark or a live payment verification.
 
-## Clip lifetime
+## Rollback
 
-Jobs and their clips auto-delete after 24 hours. Adjust `CLIP_TTL_HOURS` in `main.py`.
+Restore the preceding GitHub commit and republish the prior Netlify deploy together. Keep the data volume intact. The JSON user format remains compatible; the old release ignores the additional outbox database and backup file.

@@ -17,6 +17,8 @@ Container:
 
 import asyncio
 import json
+import re
+from contextlib import asynccontextmanager
 import os
 import shutil
 import sys
@@ -25,9 +27,11 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Header, Request, Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from reliability import start_mail_worker, queue_email, rate_limit
 from pydantic import BaseModel
 
 # Engine modules live alongside this file (flat layout for simpler deploys).
@@ -64,7 +68,49 @@ ALLOWED_ORIGINS = [
 
 # -------------------- App setup --------------------
 
-app = FastAPI(title="Reelcrate API", version="0.5.0")
+@asynccontextmanager
+async def lifespan(app):
+    # Jobs interrupted by a previous process cannot still be running.
+    for directory in JOBS_DIR.iterdir():
+        if directory.is_dir():
+            state = read_state(directory.name)
+            if state and state.get('status') not in ('done', 'failed'):
+                state.update(status='failed', message='Server restarted. Please upload again.')
+                write_state(directory.name, state)
+    stop, worker = start_mail_worker()
+    async def scheduled_cleanup():
+        while True:
+            await asyncio.to_thread(cleanup_old_jobs)
+            await asyncio.sleep(60)
+    cleanup_task = asyncio.create_task(scheduled_cleanup())
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
+        stop.set()
+        await asyncio.to_thread(worker.join, 12)
+
+app = FastAPI(title="Reelcrate API", version="0.6.0", lifespan=lifespan)
+
+@app.middleware('http')
+async def limit_auth_attempts(request: Request, call_next):
+    if request.method == 'POST' and request.url.path in {
+        '/api/auth/signup', '/api/auth/signin', '/api/auth/forgot',
+        '/api/auth/reset', '/api/auth/resend', '/api/auth/mfa/verify',
+        '/api/auth/mfa/confirm', '/api/auth/mfa/disable', '/api/waitlist'}:
+        try:
+            rate_limit('ip:' + (request.client.host if request.client else 'unknown') + ':' + request.url.path, 30)
+        except HTTPException as exc:
+            return JSONResponse({'detail': exc.detail}, status_code=exc.status_code, headers=exc.headers)
+    response = await call_next(request)
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    return response
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -79,6 +125,11 @@ app.include_router(billing_router)
 # -------------------- Job state helpers --------------------
 
 def job_dir(job_id: str) -> Path:
+    try:
+        if str(uuid.UUID(job_id)) != job_id:
+            raise ValueError()
+    except ValueError:
+        raise HTTPException(404, 'Job not found')
     return JOBS_DIR / job_id
 
 
@@ -100,13 +151,18 @@ def read_state(job_id: str) -> Optional[dict]:
         return None
 
 
+def completed_job(directory):
+    state = read_state(directory.name)
+    return bool(state and state.get('status') in ('done', 'failed'))
+
+
 def cleanup_old_jobs() -> None:
     """Best-effort: delete job dirs older than CLIP_TTL_HOURS."""
     now = time.time()
     cutoff = now - (CLIP_TTL_HOURS * 3600)
     for d in JOBS_DIR.iterdir():
         try:
-            if d.is_dir() and d.stat().st_mtime < cutoff:
+            if d.is_dir() and completed_job(d) and d.stat().st_mtime < cutoff:
                 shutil.rmtree(d, ignore_errors=True)
         except Exception:
             continue
@@ -135,7 +191,7 @@ def emergency_cleanup() -> None:
     for d in jobs:
         if _free_mb() >= 2048:
             break
-        if d.is_dir():
+        if d.is_dir() and completed_job(d):
             print(f"[cleanup] emergency delete {d.name} (free={_free_mb()} MB)")
             shutil.rmtree(d, ignore_errors=True)
 
@@ -200,7 +256,7 @@ async def process_job(job_id: str, source_path: Path, genre: str,
             try:
                 # Re-encode the 30-sec window: cheap, avoids keyframe seeking
                 # gotchas, and keeps file size small (~15–25 MB per clip).
-                subprocess.run(
+                await asyncio.to_thread(subprocess.run,
                     ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                      "-ss", str(c["start_sec"]),
                      "-i", str(source_path),
@@ -219,7 +275,7 @@ async def process_job(job_id: str, source_path: Path, genre: str,
             # Fallback audio-only cache — used only if the MP4 cut failed above.
             if not cache_ok:
                 try:
-                    subprocess.run(
+                    await asyncio.to_thread(subprocess.run,
                         ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                          "-ss", str(c["start_sec"]),
                          "-i", str(source_path),
@@ -273,6 +329,8 @@ async def process_job(job_id: str, source_path: Path, genre: str,
                           "message": f"Rendered {i + 1}/{len(clips)} clips"})
             write_state(job_id, state)
 
+        if not rendered:
+            raise RuntimeError('No clips could be rendered. Try a different file.')
         # --- Done ---
         state.update({
             "status": "done",
@@ -362,11 +420,16 @@ async def upload(
     if free_mb < 800:  # need at least 800 MB free for a modest upload
         raise HTTPException(507, f"Server disk almost full ({free_mb} MB free) — try again in a few minutes")
 
+    if any(read_state(d.name).get('status') not in ('done', 'failed') for d in JOBS_DIR.iterdir()
+           if d.is_dir() and read_state(d.name)):
+        raise HTTPException(429, 'Another set is processing. Please try again shortly.')
+
     # Create job dir; stream the upload to disk so we can handle big files.
     job_id = str(uuid.uuid4())
     out_dir = job_dir(job_id)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    write_state(job_id, {'job_id': job_id, 'status': 'uploading', 'owner_email': user_email})
     suffix = Path(file.filename or "set.mp4").suffix or ".mp4"
     source_path = out_dir / f"source{suffix}"
     size = 0
@@ -381,12 +444,20 @@ async def upload(
                     f.close()
                     shutil.rmtree(out_dir, ignore_errors=True)
                     raise HTTPException(413, "file too large (max 2 GB)")
+                if _free_mb() < 500:
+                    raise OSError('Not enough room to finish this upload')
                 f.write(chunk)
+    except asyncio.CancelledError:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        raise
     except OSError as e:
         # Disk-full or write error — clean up partial file and bail with a clean message.
         shutil.rmtree(out_dir, ignore_errors=True)
         raise HTTPException(507, f"Server ran out of storage while receiving your upload: {e}")
 
+    if size == 0:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        raise HTTPException(400, 'The uploaded file is empty')
     # Persist initial state.
     state = {
         "job_id": job_id,
@@ -402,6 +473,7 @@ async def upload(
         "num_clips": num_clips,
         "clip_length": clip_length,
         "hide_logo": hide_logo,
+        "watermark": watermark,
         "started_at": time.time(),
         "owner_email": user_email,
     }
@@ -422,10 +494,18 @@ async def upload(
 
 
 @app.get("/api/jobs/{job_id}")
-async def job_status(job_id: str):
+async def job_status(job_id: str, user_email: str = Depends(current_user)):
     state = read_state(job_id)
     if not state:
         raise HTTPException(404, "job not found (may have expired)")
+    if state.get('owner_email') != user_email:
+        raise HTTPException(403, 'Not your job')
+    from auth import make_token
+    state.pop('owner_email', None)
+    for clip in state.get('clips', []):
+        filename = f"clip_{int(clip['rank']):02d}.mp4"
+        ticket = make_token(job_id + '/' + filename, ttl=6*3600, kind='clip')
+        clip['url'] = f'/api/clips/{job_id}/{filename}?ticket={ticket}'
     return state
 
 
@@ -446,6 +526,9 @@ async def rerender_clip(job_id: str, rank: int, req: RerenderReq,
         raise HTTPException(404, "job not found (may have expired)")
     if state.get("owner_email") != user_email:
         raise HTTPException(403, "not your job")
+
+    if state.get("status") != "done":
+        raise HTTPException(409, "This job is still processing. Try again shortly.")
 
     clip_meta = next((c for c in state.get("clips", []) if int(c.get("rank", 0)) == rank), None)
     if not clip_meta:
@@ -503,13 +586,21 @@ async def rerender_clip(job_id: str, rank: int, req: RerenderReq,
             hide_logo_req = False
 
     loop = asyncio.get_event_loop()
-    ok = await loop.run_in_executor(
-        None,
-        lambda: render_clip(source_for_render, local_clip, str(out_mp4), wm, viz,
-                            hide_logo=hide_logo_req),
-    )
-    if not ok:
-        raise HTTPException(500, "Re-render failed")
+    temporary = out_dir / f"clip_{rank:02d}_editing.mp4"
+    state['status'] = 'rerendering'
+    write_state(job_id, state)
+    try:
+        ok = await loop.run_in_executor(
+            None,
+            lambda: render_clip(source_for_render, local_clip, str(temporary), wm, viz,
+                                hide_logo=hide_logo_req),
+        )
+        if not ok:
+            raise HTTPException(500, 'Re-render failed; your previous clip is still available')
+        temporary.replace(out_mp4)
+    finally:
+        state['status'] = 'done'
+        write_state(job_id, state)
 
     # Update the persisted state so /jobs returns the new caption.
     for c in state.get("clips", []):
@@ -518,21 +609,54 @@ async def rerender_clip(job_id: str, rank: int, req: RerenderReq,
     write_state(job_id, state)
 
     # Cache-bust query so the browser refetches the new bytes.
+    from auth import make_token
+    ticket = make_token(f'{job_id}/clip_{rank:02d}.mp4', ttl=6*3600, kind='clip')
     return {"ok": True,
-            "url": f"/api/clips/{job_id}/clip_{rank:02d}.mp4?v={int(time.time())}"}
+            "url": f"/api/clips/{job_id}/clip_{rank:02d}.mp4?ticket={ticket}&v={int(time.time())}"}
 
 
 @app.get("/api/clips/{job_id}/{filename}")
-async def get_clip(job_id: str, filename: str):
-    # Trim filename to basename to prevent path traversal.
-    safe = Path(filename).name
-    if not safe.endswith(".mp4"):
-        raise HTTPException(400, "only mp4 supported")
-    p = job_dir(job_id) / safe
+async def get_clip(job_id: str, filename: str, request: Request, ticket: str = '', download: bool = False):
+    from auth import verify_token
+    if not re.fullmatch(r'clip_\d{2}\.mp4', filename):
+        raise HTTPException(404, 'Clip not found')
+    if verify_token(ticket, expect_kind='clip') != job_id + '/' + filename:
+        raise HTTPException(401, 'Open your clips again to refresh this download link')
+    p = job_dir(job_id) / filename
     if not p.exists():
-        raise HTTPException(404, "clip not found")
-    return FileResponse(p, media_type="video/mp4",
-                        headers={"Cache-Control": "public, max-age=3600"})
+        raise HTTPException(404, 'Clip expired or not found')
+    size = p.stat().st_size
+    start, end, status = 0, size - 1, 200
+    headers = {'Accept-Ranges': 'bytes', 'Cache-Control': 'private, no-store'}
+    if download:
+        headers['Content-Disposition'] = f'attachment; filename="reelcrate-{filename}"'
+    value = request.headers.get('range')
+    if value:
+        match = re.fullmatch(r'bytes=(\d*)-(\d*)', value)
+        if not match or not any(match.groups()):
+            raise HTTPException(416, headers={'Content-Range': f'bytes */{size}'})
+        left, right = match.groups()
+        if left:
+            start = int(left)
+            end = min(int(right), size-1) if right else size-1
+        else:
+            start = max(0, size-int(right))
+        if start > end or start >= size:
+            raise HTTPException(416, headers={'Content-Range': f'bytes */{size}'})
+        status = 206
+        headers['Content-Range'] = f'bytes {start}-{end}/{size}'
+    headers['Content-Length'] = str(end-start+1)
+    def chunks():
+        with p.open('rb') as source:
+            source.seek(start)
+            remaining = end-start+1
+            while remaining:
+                chunk = source.read(min(256*1024, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+    return StreamingResponse(chunks(), status_code=status, media_type='video/mp4', headers=headers)
 
 
 @app.get("/")
@@ -549,6 +673,16 @@ async def root():
 
 WAITLIST_FILE = DATA_ROOT / "waitlist.json"
 ADMIN_EMAIL   = os.environ.get("ADMIN_EMAIL", "ezanaberhe@gmail.com")
+ADMIN_TOKEN   = os.environ.get("ADMIN_TOKEN", "")
+
+
+def _require_admin(authorization: Optional[str] = Header(None)) -> None:
+    import secrets
+    if len(ADMIN_TOKEN.encode()) < 32:
+        raise HTTPException(503, 'Admin API disabled; configure ADMIN_TOKEN')
+    supplied = (authorization or '')
+    if not supplied.startswith('Bearer ') or not secrets.compare_digest(supplied[7:].encode(), ADMIN_TOKEN.encode()):
+        raise HTTPException(401, 'Admin authorization required')
 
 
 class WaitlistReq(BaseModel):
@@ -601,30 +735,22 @@ async def join_waitlist(req: WaitlistReq):
         })
         _save_waitlist(entries)
 
-    # Fire both emails in a background thread so the HTTP response is fast.
-    def _send():
-        try:
-            send_waitlist_welcome(email, (req.name or "").strip())
-            send_waitlist_alert(ADMIN_EMAIL, email, (req.name or "").strip())
-        except Exception as e:
-            print(f"[waitlist] send failed: {e}")
-    asyncio.create_task(asyncio.to_thread(_send))
+    if not already:
+        queue_email(send_waitlist_welcome, email, (req.name or '').strip())
+        queue_email(send_waitlist_alert, ADMIN_EMAIL, email, (req.name or '').strip())
 
     return {"ok": True, "already_on_list": already, "total": len(entries)}
 
 
 @app.get("/api/admin/waitlist")
-async def admin_waitlist(token: str = ""):
-    """Peek at the current waitlist. Gated with JWT_SECRET."""
-    from auth import JWT_SECRET
-    if token != JWT_SECRET:
-        raise HTTPException(401, "bad token")
+async def admin_waitlist(_=Depends(_require_admin)):
+    """Peek at the current waitlist. Requires the dedicated admin bearer token."""
     entries = _load_waitlist()
     return {"count": len(entries), "entries": entries}
 
 
 @app.get("/api/admin/disk")
-async def admin_disk():
+async def admin_disk(_=Depends(_require_admin)):
     """Public disk-usage probe so I can tell if the volume is full."""
     try:
         s = shutil.disk_usage(str(DATA_ROOT))
@@ -639,13 +765,21 @@ async def admin_disk():
 
 
 @app.post("/api/admin/cleanup")
-async def admin_cleanup(token: str = ""):
-    """Force cleanup. Gate with the JWT secret so randos can't wipe our data."""
-    from auth import JWT_SECRET
-    if token != JWT_SECRET:
-        raise HTTPException(401, "bad token")
+async def admin_cleanup(_=Depends(_require_admin)):
+    """Force cleanup. Requires the dedicated admin bearer token."""
     before = _free_mb()
     for d in list(JOBS_DIR.iterdir()):
-        if d.is_dir():
+        if d.is_dir() and completed_job(d):
             shutil.rmtree(d, ignore_errors=True)
     return {"ok": True, "before_mb": before, "after_mb": _free_mb()}
+
+# Optional same-origin frontend: works on Railway and a local phone preview.
+FRONTEND = Path(__file__).parent / 'frontend'
+@app.get('/app/config.js')
+async def app_config():
+    from fastapi.responses import Response
+    return Response('window.REELCRATE_BACKEND = "";', media_type='application/javascript', headers={'Cache-Control': 'no-store'})
+
+if FRONTEND.exists():
+    app.mount('/app', StaticFiles(directory=FRONTEND / 'app', html=True), name='phone-app')
+    app.mount('/assets', StaticFiles(directory=FRONTEND), name='assets')
