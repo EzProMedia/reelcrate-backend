@@ -490,6 +490,25 @@ def test_audio_energy_does_not_invent_transitions_drops_or_crowd_reactions():
     assert all(not any(word in c['hook'] for word in forbidden) for c in clips)
 
 
+@pytest.mark.parametrize('cut_frame', [10, 11, 12])
+def test_camera_cut_command_arrives_on_its_first_frame(tmp_path, monkeypatch, cut_frame):
+    """Exercise actual FFmpeg commands, including fractional timestamps."""
+    import numpy as np, render
+    monkeypatch.setattr(render, 'W', 108)
+    cut = cut_frame / render.FPS
+    path = tmp_path / 'motion.txt'
+    initial = render._crop_commands([(0,.25),(cut-.0001,.25),(cut,.75),(1,.75)],640,1,path)
+    pixels = subprocess.check_output([
+        'ffmpeg','-v','error','-f','lavfi','-i',
+        'color=red:s=640x180:r=24000/1001:d=1,drawbox=x=320:y=0:w=320:h=180:color=blue:t=fill',
+        '-vf',f"{render.TRACK_CLOCK},sendcmd=f='{path}',crop@follow=108:180:x={initial}:y=0",
+        '-frames:v','25','-pix_fmt','rgb24','-f','rawvideo','-'])
+    frames = np.frombuffer(pixels,np.uint8).reshape(-1,180,108,3)
+    colors = frames.mean(axis=(1,2))
+    assert np.all(colors[:cut_frame,0] > 200)
+    assert np.all(colors[cut_frame:,2] > 200)
+
+
 def test_logo_validation_and_sanitized_storage(client,monkeypatch):
     from PIL import Image
     import io

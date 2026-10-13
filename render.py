@@ -35,6 +35,7 @@ WHITE = "0xFFFFFF"
 
 W, H = 1080, 1920  # 9:16 vertical
 FPS = 30
+TRACK_CLOCK = f"setpts=PTS-STARTPTS,fps={FPS}"
 
 
 # ----------------- Face-aware smart crop ---------------------------------
@@ -96,7 +97,9 @@ def _crop_commands(points, scaled_width, duration, path):
     times=np.arange(max(1,int(duration*FPS)+1))/FPS
     centers=np.interp(times,[t for t,_ in points],[x for _,x in points])
     offsets=np.clip(centers*scaled_width-W/2,0,max(0,scaled_width-W))
-    path.write_text("\n".join(f"{t:.6f} crop@follow x {int(x)};" for t,x in zip(times,offsets)))
+    # Round safely before the intended frame. Rounding 11/30 upward to
+    # 0.366667 would otherwise delay the camera-cut command by one frame.
+    path.write_text("\n".join(f"{max(0,t-.000001):.6f} crop@follow x {int(x)};" for t,x in zip(times,offsets)))
     return int(offsets[0])
 
 
@@ -154,7 +157,7 @@ def _face_crop_plan(source, start, duration, src_w, src_h):
     with tempfile.TemporaryDirectory(prefix="reelcrate-track-") as folder:
         sample=str(Path(folder)/"tracking.mp4")
         subprocess.run(["ffmpeg","-nostdin","-v","error","-y","-ss",str(start),
-                        "-t",str(duration),"-i",source,"-an","-vf","scale=640:-2,setsar=1",
+                        "-t",str(duration),"-i",source,"-an","-vf",f"{TRACK_CLOCK},scale=640:-2,setsar=1",
                         "-c:v","libx264","-preset","ultrafast","-crf","18",sample],
                        check=True,capture_output=True,timeout=max(45,duration*2))
         capture=cv2.VideoCapture(sample)
@@ -450,7 +453,7 @@ def _render_clip(source, clip, out_path, watermark, visualizer,
             if crop_plan:
                 commands_path = text_dir / "crop-motion.txt"
                 crop_x_px = _crop_commands(crop_plan,scaled_w,duration,commands_path)
-                motion_filter = f"setpts=PTS-STARTPTS,sendcmd=f='{commands_path}',"
+                motion_filter = f"{TRACK_CLOCK},sendcmd=f='{commands_path}',"
         else:
             # Portrait / square: scale to W wide → no horizontal shift possible.
             crop_x_px = 0
