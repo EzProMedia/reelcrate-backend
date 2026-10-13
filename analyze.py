@@ -114,6 +114,23 @@ def _tempo_candidates(envelope, sr, hop=128):
     return sorted(candidates, key=lambda c: -c[2])
 
 
+def _preferred_tempo_candidate(candidates):
+    """Resolve a strong bar-length repeat to an evidenced beat, when available.
+
+    Syncopated bass can repeat every four beats more strongly than every beat.
+    Only prefer its half/quarter-period peak when that peak is nearly as strong;
+    never invent a faster tempo by multiplying a slow estimate without evidence.
+    """
+    best = candidates[0]
+    if best[0] < 60:
+        for candidate in candidates[1:]:
+            bpm, strength, score = candidate
+            octave = min(abs(bpm / (best[0] * factor) - 1) for factor in (2, 4)) < .035
+            if 60 <= bpm <= 220 and octave and strength >= .3 and score >= best[2] * .85:
+                return candidate
+    return best
+
+
 def _stable_bpm(y_bass: np.ndarray, sr: int) -> tuple[float, float]:
     """Estimate local tempo and rhythmic evidence. Noise is not a confident beat.
 
@@ -127,18 +144,18 @@ def _stable_bpm(y_bass: np.ndarray, sr: int) -> tuple[float, float]:
         candidates = _tempo_candidates(envelope, sr)
         if not candidates:
             return 0.0, 0.0
-        bpm, strength, score = candidates[0]
+        bpm, strength, score = _preferred_tempo_candidate(candidates)
         confidence = float(np.clip((strength - .15) / .45, 0, 1))
         # Strong competing rhythms that aren't the same beat at half/double time
         # make a single number unreliable (often a transition or syncopation).
-        for other, _, other_score in candidates[1:]:
+        for other, _, other_score in candidates:
             same_beat = min(abs(other / (bpm * factor) - 1) for factor in (.25, 1/3, .5, 1, 2, 3, 4)) < .035
             if not same_beat and other_score > score * .92:
                 confidence = min(confidence, .45)
         n = len(envelope)
         for window in (envelope[:n*2//3], envelope[n//3:]):
             local = _tempo_candidates(window, sr)
-            if local and min(abs(local[0][0] / (bpm * factor) - 1) for factor in (.25, 1/3, .5, 1, 2, 3, 4)) > .035:
+            if local and min(abs(_preferred_tempo_candidate(local)[0] / (bpm * factor) - 1) for factor in (.25, 1/3, .5, 1, 2, 3, 4)) > .035:
                 confidence = min(confidence, .4)
         return bpm, confidence
     except Exception:

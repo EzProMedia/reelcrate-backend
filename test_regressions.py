@@ -338,7 +338,7 @@ def test_short_set_does_not_duplicate_clips_and_silence_rejected(tmp_path):
     sf.write(p,np.zeros(sr*4),sr)
     with pytest.raises(ValueError,match='no usable audio'):detect_drops(str(p))
 
-@pytest.mark.parametrize('bpm',[60,70,80,95,105,110,120,128,140,174,190])
+@pytest.mark.parametrize('bpm',[30,40,50,60,70,80,95,105,110,120,128,140,174,190])
 def test_known_beat_rates_are_not_quantized_or_octave_shifted(bpm):
     import numpy as np
     from analyze import _stable_bpm
@@ -346,6 +346,34 @@ def test_known_beat_rates_are_not_quantized_or_octave_shifted(bpm):
     for beat in np.arange(0,20,60/bpm):
         dt=t-beat
         y+=np.where((dt>=0)&(dt<.12),np.sin(2*np.pi*90*dt)*np.exp(-np.maximum(dt,0)*40),0)
+    actual,confidence=_stable_bpm(y,sr)
+    assert abs(actual-bpm)<.8,(bpm,actual)
+    assert confidence>=.55
+
+
+def test_bar_length_repeat_prefers_a_strong_observed_beat_peak():
+    from analyze import _preferred_tempo_candidate
+    candidates=[(34.84,.531,.480),(139.48,.467,.465),(70.33,.376,.359)]
+    assert _preferred_tempo_candidate(candidates)==candidates[1]
+    # A genuine slow pulse, a weak subdivision, or an unrelated faster rhythm
+    # must not be arbitrarily doubled just to land in a typical DJ tempo range.
+    for candidates in [
+        [(40,.7,.63),(80,.2,.19)],
+        [(40,.7,.63),(80,.4,.38)],
+        [(40,.7,.63),(110,.62,.61)],
+        [(70,.7,.66),(140,.68,.65)],
+    ]:
+        assert _preferred_tempo_candidate(candidates)==candidates[0]
+
+
+@pytest.mark.parametrize('bpm',[70,130,140,174])
+def test_accented_beats_do_not_report_the_four_beat_bar(bpm):
+    import numpy as np
+    from analyze import _stable_bpm
+    sr=11025;t=np.arange(sr*30)/sr;y=np.zeros_like(t)
+    for i,beat in enumerate(np.arange(0,30,60/bpm)):
+        dt=t-beat;accent=(1,.6,.8,.6)[i%4]
+        y+=accent*np.where((dt>=0)&(dt<.12),np.sin(2*np.pi*90*dt)*np.exp(-np.maximum(dt,0)*40),0)
     actual,confidence=_stable_bpm(y,sr)
     assert abs(actual-bpm)<.8,(bpm,actual)
     assert confidence>=.55
