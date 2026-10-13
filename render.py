@@ -48,6 +48,18 @@ FPS = 30
 # whenever OpenCV is unavailable or no faces show up.
 
 _FACE_CASCADE = None
+FACE_MODEL = Path(__file__).with_name("face_detection_yunet_2023mar.onnx")
+
+
+def _foreground_face_center(hits):
+    """Favor the prominent foreground face over a crowd of smaller faces."""
+    if not hits:
+        return 0.5
+    largest = max(hits, key=lambda hit: hit[1])
+    prominent = [hit for hit in hits
+                 if hit[1] >= largest[1] * .6 and abs(hit[0] - largest[0]) <= .2]
+    return max(.15, min(.85, sum(cx * weight for cx, _, weight in prominent)
+                       / sum(weight for _, _, weight in prominent)))
 
 def _get_face_cascade():
     global _FACE_CASCADE
@@ -69,14 +81,10 @@ def _find_face_center_x(source: str, start: float, duration: float,
                         src_w: int, src_h: int) -> float:
     """Return 0..1 giving the horizontal center-of-interest for a 9:16 crop.
 
-    Samples 5 frames from within [start, start+duration], runs face
-    detection, weights each hit by the box area (bigger faces = more
-    important), then averages. Returns 0.5 if nothing found.
+    Samples 5 frames from within [start, start+duration]. Prefer the foreground
+    face and nearby similarly sized detections; don't average in the crowd.
+    Returns 0.5 if nothing is found. Full-frame mode remains the safe default.
     """
-    cascade = _get_face_cascade()
-    if cascade is None:
-        return 0.5
-
     # If the source is already portrait or square, a horizontal shift buys
     # us nothing — the crop is already the full width.
     if src_w <= 0 or src_h <= 0 or src_w * 16 <= src_h * 9:
@@ -84,6 +92,18 @@ def _find_face_center_x(source: str, start: float, duration: float,
 
     import cv2
     import numpy as np
+
+    # Each render gets its own detector: OpenCV inference objects are mutable
+    # and simultaneous customer jobs must not share their input dimensions.
+    detector = None
+    try:
+        if FACE_MODEL.is_file():
+            detector = cv2.FaceDetectorYN.create(str(FACE_MODEL), "", (640, 360), .8, .3, 1000)
+    except Exception as e:
+        print(f"    [smart-crop] foreground detector unavailable: {type(e).__name__}")
+    cascade = _get_face_cascade() if detector is None else None
+    if detector is None and cascade is None:
+        return 0.5
 
     n_samples = 5
     # Sample points spread across the interior of the window (avoid start
@@ -94,18 +114,17 @@ def _find_face_center_x(source: str, start: float, duration: float,
         step = duration / (n_samples + 1)
         ts = [start + step * (i + 1) for i in range(n_samples)]
 
-    total_wx = 0.0
-    total_w = 0.0
+    hits = []
 
     for t in ts:
-        # Grab a single JPEG frame via ffmpeg at time t. Downscale to
-        # 640 wide to keep detection fast.
+        # Lossless samples avoid JPEG artifacts changing the detected faces
+        # between the original upload and its compressed per-clip cache.
         try:
             proc = subprocess.run(
                 ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
                  "-ss", f"{t:.2f}", "-i", source,
                  "-frames:v", "1", "-vf", "scale=640:-2",
-                 "-f", "image2pipe", "-vcodec", "mjpeg", "-"],
+                 "-threads", "1", "-f", "image2pipe", "-vcodec", "png", "-"],
                 capture_output=True, timeout=8
             )
             buf = proc.stdout
@@ -115,13 +134,15 @@ def _find_face_center_x(source: str, start: float, duration: float,
             img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
             if img is None:
                 continue
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            gray = cv2.equalizeHist(gray)
-            faces = cascade.detectMultiScale(
-                gray, scaleFactor=1.15, minNeighbors=4,
-                minSize=(40, 40),
-            )
-            fh, fw = gray.shape[:2]
+            fh, fw = img.shape[:2]
+            if detector is not None:
+                detector.setInputSize((fw, fh))
+                _, detected = detector.detect(img)
+                faces = [] if detected is None else detected[:, :4]
+            else:
+                gray = cv2.equalizeHist(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+                faces = cascade.detectMultiScale(
+                    gray, scaleFactor=1.15, minNeighbors=4, minSize=(40, 40))
             for (x, y, w, h) in faces:
                 # Weight by area — a big DJ face matters more than a
                 # tiny background one — and by centrality on Y (skip
@@ -132,20 +153,13 @@ def _find_face_center_x(source: str, start: float, duration: float,
                 y_weight = max(0.15, y_weight)
                 weight = area * y_weight
                 cx = (x + w / 2) / fw
-                total_wx += cx * weight
-                total_w += weight
+                hits.append((float(cx), area, float(weight)))
         except Exception as e:
             print(f"    [smart-crop] sample at {t:.1f}s failed: {e}")
             continue
 
-    if total_w <= 0:
-        return 0.5
-
-    fx = total_wx / total_w
-    # Don't shove the crop all the way to the edge — clamp to a
-    # reasonable interior band so we never lose half the frame.
-    fx = max(0.15, min(0.85, fx))
-    print(f"    [smart-crop] face_x_frac={fx:.3f} from {int(total_w)} weighted hits")
+    fx = _foreground_face_center(hits)
+    print(f"    [smart-crop] face_x_frac={fx:.3f} from {len(hits)} face observations")
     return fx
 
 # Visualizer styles, cycled by clip rank so each clip in a batch gets a different look.

@@ -15,6 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Engine + API (flat layout: main.py + analyze.py + render.py all in /app)
 COPY *.py ./
+COPY face_detection_yunet_2023mar.onnx YUNET-LICENSE.txt ./
 
 # Data folder mounted as a volume on Railway / fly.io / etc.
 ENV REELCRATE_DATA=/data

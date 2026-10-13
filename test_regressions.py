@@ -389,6 +389,24 @@ def test_noise_is_not_confident_and_range_returns_actual_interpretation():
     assert _bpm_for_range(128,90,110)==0
 
 
+def test_crop_favors_foreground_over_background_crowd():
+    from render import _foreground_face_center
+    hits=[(.64,7000,6500),(.66,6800,6300)]+[(.2,1600,1500)]*20
+    assert .64 <= _foreground_face_center(hits) <= .66
+    # Similar-sized people far apart must not pull the crop into empty space.
+    assert _foreground_face_center([(.2,7000,6500),(.8,6900,6400)])==.2
+    assert _foreground_face_center([])==.5
+
+
+def test_bundled_foreground_detector_loads_and_ignores_blank_frames():
+    import cv2,numpy as np,hashlib
+    from render import FACE_MODEL
+    assert hashlib.sha256(FACE_MODEL.read_bytes()).hexdigest()=='8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4'
+    detector=cv2.FaceDetectorYN.create(str(FACE_MODEL),'',(640,360),.8,.3,1000)
+    _,faces=detector.detect(np.zeros((360,640,3),dtype=np.uint8))
+    assert faces is None
+
+
 def test_logo_validation_and_sanitized_storage(client,monkeypatch):
     from PIL import Image
     import io

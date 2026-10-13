@@ -47,3 +47,17 @@ The renderer preserves the full frame by default, offers a crop option, protects
 The separate Netlify frontend supplies five animated visualizer previews made from a synthetic test beat, actual upload progress, custom-branding controls, last-job recovery and one private ZIP download. Placeholder stats, unsupported post scheduling and disconnected edit-style controls are removed.
 
 Local verification uses isolated accounts and a 52-minute 1080p DJ recording; no demo media, customer records, credentials or test accounts belong in this repository. The unit suite covers known beat rates, noise confidence, chunk alignment, settings gates, logo validation, signed ZIP downloads and caption edits. Full render testing must additionally check output counts, durations, playback and audio. Actual iPhone/Android device testing and concurrent-user capacity testing remain separate from a desktop browser at phone size.
+
+### Foreground framing model
+
+Fill-screen framing uses the small OpenCV YuNet 2023 model to locate faces,
+then favors the larger foreground face over smaller background faces. It samples
+five moments per clip and uses a fixed crop; keep-full-frame remains the default
+for moving cameras, groups, and shots where the decks need to stay visible.
+The detector runs inside this service and does not send frames to another API.
+
+Model: https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet
+
+The bundled `face_detection_yunet_2023mar.onnx` is distributed under the MIT
+license included in `YUNET-LICENSE.txt`. SHA-256:
+`8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4`.
