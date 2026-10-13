@@ -142,6 +142,7 @@ def _public(u: dict) -> dict:
         "mfa_enabled": bool(u.get("mfa_enabled")),
         "subscription_status": u.get("subscription_status"),
         "subscription_current_period_end": u.get("subscription_current_period_end"),
+        "billing_setup_required": bool(u.get("billing_setup_required")),
     }
 
 

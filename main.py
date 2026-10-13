@@ -43,7 +43,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from analyze import detect_drops, assign_hooks, GENRE_BPM_RANGES  # type: ignore
 from render import render_clip, VISUALIZER_STYLES  # type: ignore
 from auth import router as auth_router, current_user  # type: ignore
-from billing import router as billing_router, is_paying  # type: ignore
+from billing import router as billing_router, is_paying, stripe, stripe_error_handler  # type: ignore
 
 
 # -------------------- Configuration --------------------
@@ -98,7 +98,8 @@ async def lifespan(app):
         stop.set()
         await asyncio.to_thread(worker.join, 12)
 
-app = FastAPI(title="Reelcrate API", version="0.7.0", lifespan=lifespan)
+app = FastAPI(title="Reelcrate API", version="0.7.1", lifespan=lifespan)
+app.add_exception_handler(stripe.error.StripeError, stripe_error_handler)
 
 @app.middleware('http')
 async def limit_auth_attempts(request: Request, call_next):

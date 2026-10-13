@@ -18,13 +18,16 @@ upload gate in main.py.
 """
 
 import asyncio
+import hashlib
 import json
+import logging
 import os
 import time
 from typing import Optional
 
 import stripe
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from reliability import queue_email
 
@@ -49,6 +52,7 @@ if STRIPE_SECRET_KEY:
 
 
 router = APIRouter(prefix="/api/billing", tags=["billing"])
+logger = logging.getLogger(__name__)
 
 
 # -------------------- helpers --------------------
@@ -56,6 +60,8 @@ router = APIRouter(prefix="/api/billing", tags=["billing"])
 def is_paying(email: str) -> bool:
     """The upload gate calls this to decide whether to accept an upload."""
     u = _load_users().get(email) or {}
+    if u.get("billing_setup_required"):
+        return False
     status = u.get("subscription_status")
     if status in ("trialing", "active"):
         # Also check current_period_end if we have it — Stripe events may lag.
@@ -70,27 +76,67 @@ def _billing_public(u: dict) -> dict:
         "subscription_status":              u.get("subscription_status"),
         "subscription_current_period_end":  u.get("subscription_current_period_end"),
         "has_stripe_customer":              bool(u.get("stripe_customer_id")),
+        "billing_setup_required":           bool(u.get("billing_setup_required")),
     }
 
 
+def _missing_customer(exc: Exception) -> bool:
+    """Only recover a missing customer, never a price or connection error."""
+    return isinstance(exc, stripe.error.InvalidRequestError) and (
+        (getattr(exc, "code", None) == "resource_missing"
+         and getattr(exc, "param", None) in ("customer", "id"))
+        or "No such customer:" in str(exc)
+    )
+
+
+async def stripe_error_handler(request: Request, exc: Exception):
+    # Handled errors retain CORS headers. Never expose Stripe internals to DJs.
+    logger.warning("Billing request failed: path=%s type=%s code=%s request=%s",
+                   request.url.path, type(exc).__name__, getattr(exc, "code", None),
+                   getattr(exc, "request_id", None))
+    return JSONResponse(status_code=502, content={"detail":
+        "We couldn't open billing right now. Please try again shortly. "
+        "If it continues, contact support@reelcrate.app."})
+
+
 async def _get_or_create_customer(email: str, name: str = "") -> str:
-    """Fetch existing Stripe customer id or create one, and cache it on the user."""
+    """Validate legacy IDs in the current Stripe mode before opening checkout."""
     users = _load_users()
     u = users.get(email)
     if not u:
         raise HTTPException(401, "Account not found")
     cid = u.get("stripe_customer_id")
     if cid:
-        return cid
+        try:
+            customer = await asyncio.to_thread(stripe.Customer.retrieve, cid)
+            if not customer.get("deleted"):
+                return cid
+        except stripe.error.InvalidRequestError as exc:
+            if not _missing_customer(exc):
+                raise
+    mode = "live" if STRIPE_SECRET_KEY.startswith(("sk_live_", "rk_live_")) else "test"
+    # A mode change or deleted customer must not replay the previous create call.
+    identity = hashlib.sha256(f"{mode}:{email}:{cid or 'new'}".encode()).hexdigest()
     customer = await asyncio.to_thread(stripe.Customer.create,
         email=email,
         name=name or u.get("name", ""),
         metadata={"reelcrate_email": email},
-        idempotency_key="customer:" + email,
+        idempotency_key="customer:" + identity,
     )
     users = _load_users()
     u = users[email]
+    if cid and u.get("stripe_customer_id") == cid:
+        u.setdefault("billing_history", []).append({
+            key: u.get(key) for key in (
+                "stripe_customer_id", "subscription_id", "subscription_status",
+                "subscription_current_period_end", "subscription_welcome_sent_at")
+        })
+        for key in ("subscription_id", "subscription_status", "subscription_current_period_end",
+                    "subscription_welcome_sent_at"):
+            u.pop(key, None)
     u["stripe_customer_id"] = customer.id
+    u["stripe_customer_mode"] = mode
+    u.pop("billing_setup_required", None)
     _save_users(users)
     return customer.id
 
@@ -182,11 +228,22 @@ async def portal(email: str = Depends(current_user)):
     u = users.get(email) or {}
     cid = u.get("stripe_customer_id")
     if not cid:
-        raise HTTPException(400, "No Stripe customer yet — start a subscription first")
-    session = await asyncio.to_thread(stripe.billing_portal.Session.create,
-        customer=cid,
-        return_url=f"{APP_URL}/app/",
-    )
+        raise HTTPException(409, {"code": "billing_setup_required",
+                                 "message": "Choose a plan to set up billing for your account."})
+    try:
+        session = await asyncio.to_thread(stripe.billing_portal.Session.create,
+            customer=cid,
+            return_url=f"{APP_URL}/app/",
+        )
+    except stripe.error.InvalidRequestError as exc:
+        if not _missing_customer(exc):
+            raise
+        users = _load_users()
+        if users.get(email, {}).get("stripe_customer_id") == cid:
+            users[email]["billing_setup_required"] = True
+            _save_users(users)
+        raise HTTPException(409, {"code": "billing_setup_required",
+            "message": "Your account isn't connected to live billing yet. Choose a plan to continue."}) from exc
     return {"url": session.url}
 
 
@@ -217,6 +274,9 @@ def _apply_subscription(sub: dict):
     users = _load_users()
     u = users.get(email)
     if not u:
+        return
+    # An old customer event must not overwrite a newly connected billing account.
+    if sub.get("customer") and u.get("stripe_customer_id") not in (None, sub["customer"]):
         return
 
     new_status = sub.get("status")

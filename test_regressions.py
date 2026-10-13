@@ -27,6 +27,7 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(main, 'ADMIN_TOKEN', 'a'*40)
     monkeypatch.setattr(billing, 'STRIPE_SECRET_KEY', 'sk_test_mock')
     monkeypatch.setattr(billing, '_PRICE_BY_PLAN', {'monthly':'price_mock'})
+    monkeypatch.setattr(billing.stripe.Customer, 'retrieve', Mock(return_value={'id':'cus_mock'}))
     auth._save_users({'dj@example.test': {'email':'dj@example.test','verified':True,'stripe_customer_id':'cus_mock'}})
 
 @pytest.fixture
@@ -99,6 +100,86 @@ def test_stripe_calls_do_not_block_event_loop(monkeypatch):
         assert time.monotonic()-start < .10
         await task
     asyncio.run(run())
+
+
+def test_missing_portal_customer_routes_to_setup_with_cors(client, monkeypatch):
+    create = Mock(side_effect=billing.stripe.error.InvalidRequestError(
+        "No such customer: 'cus_mock'; a similar object exists in test mode", 'customer', code='resource_missing'))
+    monkeypatch.setattr(billing.stripe.billing_portal.Session, 'create', create)
+    r = client.post('/api/billing/portal', headers={**headers(), 'Origin':'https://reelcrate.app'})
+    assert r.status_code == 409
+    assert r.json()['detail']['code'] == 'billing_setup_required'
+    assert r.headers['access-control-allow-origin'] == 'https://reelcrate.app'
+    u = auth._load_users()['dj@example.test']
+    assert u['stripe_customer_id'] == 'cus_mock' and u['billing_setup_required']
+    assert not billing.is_paying('dj@example.test')
+    assert client.get('/api/auth/me', headers=headers()).json()['billing_setup_required']
+
+
+@pytest.mark.parametrize('deleted', [False, True])
+def test_checkout_replaces_missing_customer_preserving_history(client, monkeypatch, deleted):
+    u = auth._load_users()['dj@example.test']
+    u.update(subscription_id='sub_old', subscription_status='trialing',
+             subscription_current_period_end=1, billing_setup_required=True)
+    auth._save_users({'dj@example.test':u})
+    retrieve = Mock(return_value={'id':'cus_mock','deleted':True}) if deleted else Mock(
+        side_effect=billing.stripe.error.InvalidRequestError('No such customer: cus_mock', 'id', code='resource_missing'))
+    monkeypatch.setattr(billing.stripe.Customer, 'retrieve', retrieve)
+    customer = Mock(return_value=SimpleNamespace(id='cus_new'))
+    monkeypatch.setattr(billing.stripe.Customer, 'create', customer)
+    checkout = Mock(return_value=SimpleNamespace(id='cs_new', url='https://checkout.stripe.com/mock'))
+    monkeypatch.setattr(billing.stripe.checkout.Session, 'create', checkout)
+    r = client.post('/api/billing/checkout', headers=headers(), json={})
+    assert r.status_code == 200
+    assert checkout.call_args.kwargs['customer'] == 'cus_new'
+    u = auth._load_users()['dj@example.test']
+    assert u['verified'] and u['stripe_customer_id'] == 'cus_new'
+    assert u['billing_history'][0]['subscription_id'] == 'sub_old'
+    assert not u.get('billing_setup_required') and not u.get('subscription_status')
+    assert not billing.is_paying('dj@example.test')  # A checkout draft grants no access.
+    billing._apply_subscription({'id':'sub_old','customer':'cus_mock','status':'active',
+        'metadata':{'reelcrate_email':'dj@example.test'}})
+    assert auth._load_users()['dj@example.test']['stripe_customer_id'] == 'cus_new'
+    assert not billing.is_paying('dj@example.test')
+
+
+@pytest.mark.parametrize('where', ['portal', 'retrieve', 'create', 'checkout_retry'])
+def test_stripe_failures_are_safe_readable_and_do_not_rebind_accounts(client, monkeypatch, where):
+    failure = billing.stripe.error.APIConnectionError('private diagnostic must not reach browser')
+    path = '/api/billing/checkout'
+    if where == 'portal':
+        path = '/api/billing/portal'
+        monkeypatch.setattr(billing.stripe.billing_portal.Session, 'create', Mock(side_effect=failure))
+    elif where == 'retrieve':
+        monkeypatch.setattr(billing.stripe.Customer, 'retrieve', Mock(side_effect=failure))
+    elif where == 'create':
+        auth._save_users({'dj@example.test':{'email':'dj@example.test','verified':True}})
+        monkeypatch.setattr(billing.stripe.Customer, 'create', Mock(side_effect=failure))
+    else:
+        monkeypatch.setattr(billing, '_resolve_promotion_code', lambda code:'promo_bad')
+        monkeypatch.setattr(billing.stripe.checkout.Session, 'create', Mock(side_effect=[
+            billing.stripe.error.InvalidRequestError('expired', 'discounts[0][promotion_code]'), failure]))
+    before = auth._load_users()
+    r = client.post(path, headers={**headers(), 'Origin':'https://reelcrate.app'}, json={'promo':'EXPIRED'})
+    assert r.status_code == 502
+    assert r.headers['access-control-allow-origin'] == 'https://reelcrate.app'
+    assert 'private diagnostic' not in r.text and 'support@reelcrate.app' in r.text
+    assert auth._load_users() == before
+
+
+def test_existing_customer_opens_portal_without_replacement(client, monkeypatch):
+    create = Mock(return_value=SimpleNamespace(url='https://billing.stripe.com/mock'))
+    monkeypatch.setattr(billing.stripe.billing_portal.Session, 'create', create)
+    r = client.post('/api/billing/portal', headers=headers())
+    assert r.status_code == 200 and create.call_args.kwargs['customer'] == 'cus_mock'
+
+
+def test_portal_configuration_error_does_not_reset_customer(client, monkeypatch):
+    monkeypatch.setattr(billing.stripe.billing_portal.Session, 'create', Mock(
+        side_effect=billing.stripe.error.InvalidRequestError('Missing portal configuration', 'configuration')))
+    before = auth._load_users()
+    assert client.post('/api/billing/portal', headers=headers()).status_code == 502
+    assert auth._load_users() == before
 
 def test_email_persist_retry_and_deduplicate(monkeypatch):
     send=Mock(side_effect=[False,True])
