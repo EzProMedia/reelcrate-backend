@@ -317,6 +317,19 @@ def test_rerender_removes_caption_and_name_and_retains_tempo(client,monkeypatch)
     assert main.read_state(jid)['clips'][0]['show_caption'] is False
 
 
+def test_rerender_reports_the_actual_framing_after_tracking_fallback(client,monkeypatch):
+    jid=job();d=main.job_dir(jid);(d/'clip_01_src.mp4').write_bytes(b'source')
+    def render(src,clip,path,*args,**kwargs):
+        clip['framing_applied']='fit';clip['tracking']={'coverage':.2}
+        Path(path).write_bytes(b'updated');return True
+    monkeypatch.setattr(main,'render_clip',render)
+    r=client.post(f'/api/clips/{jid}/1/rerender',headers=headers(),json={'caption':'from the booth','framing':'crop'})
+    assert r.status_code==200
+    c=main.read_state(jid)['clips'][0]
+    assert c['framing']=='fit' and c['framing_requested']=='crop'
+    assert c['tracking']['coverage']==.2
+
+
 def test_analysis_grid_stays_aligned_across_chunks(tmp_path):
     import numpy as np,soundfile as sf
     from analyze import _stream_rms_and_flux
@@ -390,12 +403,17 @@ def test_noise_is_not_confident_and_range_returns_actual_interpretation():
 
 
 def test_crop_favors_foreground_over_background_crowd():
-    from render import _foreground_face_center
-    hits=[(.64,7000,6500),(.66,6800,6300)]+[(.2,1600,1500)]*20
-    assert .64 <= _foreground_face_center(hits) <= .66
-    # Similar-sized people far apart must not pull the crop into empty space.
-    assert _foreground_face_center([(.2,7000,6500),(.8,6900,6400)])==.2
-    assert _foreground_face_center([])==.5
+    from render import _select_foreground_face
+    dj=(400,100,80,90); crowd=[(100+i,120,30,35) for i in range(20)]
+    assert _select_foreground_face([dj]+crowd,None,640)==dj
+    assert _select_foreground_face([dj]+crowd,.2,640)==dj
+    # Retain a nearby foreground subject when a similar face crosses.
+    other=(100,100,85,90)
+    assert _select_foreground_face([dj,other],.7,640)==dj
+    assert _select_foreground_face([dj,other],None,640)==other
+    # Looking down must not transfer the track to a smaller crowd face.
+    assert _select_foreground_face(crowd,.7,640,7200) is None
+    assert _select_foreground_face([other],.7,640,7200) is None
 
 
 def test_bundled_foreground_detector_loads_and_ignores_blank_frames():
@@ -405,6 +423,59 @@ def test_bundled_foreground_detector_loads_and_ignores_blank_frames():
     detector=cv2.FaceDetectorYN.create(str(FACE_MODEL),'',(640,360),.8,.3,1000)
     _,faces=detector.detect(np.zeros((360,640,3),dtype=np.uint8))
     assert faces is None
+
+
+def test_tracking_follows_movement_and_resets_at_camera_cuts():
+    from render import _crop_track
+    observations=[(i*.25,.25+i*.015,.07) for i in range(8)]
+    observations += [(2+i*.25,.75-i*.015,.07) for i in range(8)]
+    points=_crop_track(observations,4,.316,[2.])
+    assert points is not None
+    assert points[0][1] < .3 and points[-1][1] > .6
+    before=next(x for t,x in points if abs(t-1.9999)<.00001)
+    after=next(x for t,x in points if t==2.)
+    assert after-before > .3  # cut, no pan across the empty middle
+    for t,cx,width in observations:
+        x=min(points,key=lambda p:abs(p[0]-t))[1]
+        assert x-.158 <= cx-width/2 and x+.158 >= cx+width/2
+
+
+def test_tracking_refuses_blind_intervals_and_faces_too_wide():
+    from render import _crop_track
+    assert _crop_track([(0,.5,.1),(.25,.5,.1),(3,.5,.1)],4,.316) is None
+    assert _crop_track([(0,None,0),(.25,None,0)],.5,.316) is None
+    assert _crop_track([(0,.5,.4),(.25,.5,.4)],.5,.316) is None
+    assert _crop_track([(0,.5,.1),(.25,None,0),(.5,.52,.1)],.75,.316)
+
+
+def test_occluded_face_motion_uses_local_pixels():
+    import cv2,numpy as np
+    from render import _flow_face_box
+    previous=np.random.default_rng(17).integers(0,255,(180,320),dtype=np.uint8)
+    current=cv2.warpAffine(previous,np.float32([[1,0,12],[0,1,5]]),(320,180))
+    box=_flow_face_box(previous,current,np.array([100,50,60,70],dtype=np.float32))
+    assert box is not None
+    assert abs(box[0]-112)<1 and abs(box[1]-55)<1
+    assert _flow_face_box(np.zeros_like(previous),np.zeros_like(previous),np.array([100,50,60,70])) is None
+
+
+def test_new_shot_uses_foreground_evidence_beyond_its_first_frame(monkeypatch):
+    import numpy as np,render
+    gray=np.zeros((180,320),dtype=np.uint8)
+    crowd=(230,40,20,25);dj=(70,40,60,70)
+    monkeypatch.setattr(render,'_flow_face_box',lambda previous,current,box:box)
+    samples=[(0.,gray,[crowd]),(.25,gray,[crowd]),(.5,gray,[crowd,dj]),(.75,gray,[crowd,dj])]
+    path=render._track_shot(samples,320)
+    assert all(abs(x-100/320)<.001 for _,x,_ in path)
+
+
+def test_audio_energy_does_not_invent_transitions_drops_or_crowd_reactions():
+    from analyze import assign_hooks
+    clips=assign_hooks([dict(energy=e,flux=1.,flux_sustain=1.,peak_sec=i*30)
+                        for i,e in enumerate([.9,.7,.4]*4)])
+    assert {c['tag'] for c in clips}=={'ENERGY','MOMENT','VIBE'}
+    forbidden=['transition','blend','drop','build','scream','room went','two tracks']
+    assert all(not any(word in c['hook'] for word in forbidden) for c in clips)
 
 
 def test_logo_validation_and_sanitized_storage(client,monkeypatch):

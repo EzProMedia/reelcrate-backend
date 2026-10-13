@@ -42,125 +42,199 @@ FPS = 30
 # When we cut a 9:16 window out of a landscape video, a naive center crop
 # slices off whoever is standing to one side of frame — DJs behind the
 # booth, dancers in the corner, reactions on the flank. This helper
-# samples a few frames across the clip window, runs a Haar cascade face
-# detector, and returns a horizontal center-of-interest in the range
-# 0..1 so ffmpeg can crop toward it. Falls back to 0.5 (dead center)
-# whenever OpenCV is unavailable or no faces show up.
+# follows the foreground face throughout each shot. Camera cuts reset the
+# track; missing evidence preserves the full shot instead of guessing.
 
-_FACE_CASCADE = None
 FACE_MODEL = Path(__file__).with_name("face_detection_yunet_2023mar.onnx")
 
 
-def _foreground_face_center(hits):
-    """Favor the prominent foreground face over a crowd of smaller faces."""
-    if not hits:
-        return 0.5
-    largest = max(hits, key=lambda hit: hit[1])
-    prominent = [hit for hit in hits
-                 if hit[1] >= largest[1] * .6 and abs(hit[0] - largest[0]) <= .2]
-    return max(.15, min(.85, sum(cx * weight for cx, _, weight in prominent)
-                       / sum(weight for _, _, weight in prominent)))
+def _crop_track(observations, duration, crop_width, cuts=()):
+    """Build a bounded, smooth path; never interpolate across camera cuts.
 
-def _get_face_cascade():
-    global _FACE_CASCADE
-    if _FACE_CASCADE is not None:
-        return _FACE_CASCADE
-    try:
-        import cv2
-        path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
-        _FACE_CASCADE = cv2.CascadeClassifier(path)
-        if _FACE_CASCADE.empty():
-            _FACE_CASCADE = None
-    except Exception as e:
-        print(f"    [smart-crop] cv2 unavailable: {e}")
-        _FACE_CASCADE = None
-    return _FACE_CASCADE
-
-
-def _find_face_center_x(source: str, start: float, duration: float,
-                        src_w: int, src_h: int) -> float:
-    """Return 0..1 giving the horizontal center-of-interest for a 9:16 crop.
-
-    Samples 5 frames from within [start, start+duration]. Prefer the foreground
-    face and nearby similarly sized detections; don't average in the crowd.
-    Returns 0.5 if nothing is found. Full-frame mode remains the safe default.
+    Observations are (seconds, center, face width), including None for misses.
+    A long blind interval or a face wider than the crop requires a wide view.
     """
-    # If the source is already portrait or square, a horizontal shift buys
-    # us nothing — the crop is already the full width.
-    if src_w <= 0 or src_h <= 0 or src_w * 16 <= src_h * 9:
-        return 0.5
+    import numpy as np
+    boundaries = [0.] + sorted(t for t in cuts if 0 < t < duration) + [duration]
+    points = []
+    half = crop_width / 2
+    for begin, end in zip(boundaries, boundaries[1:]):
+        samples = [o for o in observations if begin <= o[0] < end]
+        known = [o for o in samples if o[1] is not None]
+        if not known or len(known) < len(samples) * .6:
+            return None
+        times = [begin] + [o[0] for o in known] + [end]
+        if max(b-a for a,b in zip(times,times[1:])) > 1.5:
+            return None
+        centers = []
+        for i, (t, cx, width) in enumerate(known):
+            if width + .06 > crop_width:
+                return None
+            # Small median smoothing suppresses detection jitter. Clamp it to
+            # a safe interval so smoothing cannot push the face off screen.
+            smooth = float(np.median([o[1] for o in known[max(0,i-1):i+2]]))
+            lo = max(half, cx + width/2 + .03 - half)
+            hi = min(1-half, cx - width/2 - .03 + half)
+            if lo > hi:
+                return None
+            centers.append((t, max(lo,min(hi,smooth))))
+        points.append((begin, centers[0][1]))
+        points.extend((t,x) for t,x in centers if begin < t < end)
+        # A tiny interval gives an immediate cut instead of a pan through
+        # unrelated scenery; it is shorter than one output frame.
+        points.append((max(begin,end-.0001), centers[-1][1]))
+    return points
 
+
+def _crop_expression(points, scaled_width):
+    """Piecewise linear motion, evaluated for every output video frame."""
+    positions = [(t, max(0, min(scaled_width-W, x*scaled_width-W/2))) for t,x in points]
+    expression = f"{positions[0][1]:.3f}"
+    for (ta,xa),(tb,xb) in zip(positions,positions[1:]):
+        if abs(xb-xa) < .1:
+            continue
+        expression += f"+({xb-xa:.3f})*clip((t-{ta:.4f})/{max(.0001,tb-ta):.4f},0,1)"
+    return expression
+
+
+def _track_shot(samples, frame_width):
+    """Anchor on the clearest foreground face in the shot, then track both ways.
+
+    Starting at the first frame is unsafe: a camera may cut while the DJ is
+    looking down, leaving only a background face detectable in that frame.
+    """
+    import numpy as np
+    choices=[(float(f[2]*f[3]),i,f) for i,(_,_,faces) in enumerate(samples) for f in faces]
+    if not choices:
+        return [(t,None,0.) for t,_,_ in samples]
+    _,seed,seed_box=max(choices,key=lambda item:item[0])
+    observations={seed:(samples[seed][0],float((seed_box[0]+seed_box[2]/2)/frame_width),float(seed_box[2]/frame_width))}
+    for direction in (-1,1):
+        last_box=np.array(seed_box,dtype=np.float32)
+        last_gray=samples[seed][1];last_seen=samples[seed][0]
+        for i in range(seed+direction,len(samples) if direction==1 else -1,direction):
+            t,gray,faces=samples[i]
+            predicted=_flow_face_box(last_gray,gray,last_box)
+            anchor=predicted if predicted is not None else last_box
+            chosen=_select_foreground_face(faces,float((anchor[0]+anchor[2]/2)/frame_width),
+                                           frame_width,float(anchor[2]*anchor[3]))
+            if chosen is not None:
+                last_seen=t
+            elif predicted is not None and abs(t-last_seen)<=4.:
+                chosen=predicted
+            elif abs(t-last_seen)<=.75:
+                chosen=last_box
+            if chosen is None:
+                observations[i]=(t,None,0.)
+                if predicted is not None:
+                    last_box=predicted
+            else:
+                x,y,w,h=chosen
+                observations[i]=(t,float((x+w/2)/frame_width),float(w/frame_width))
+                last_box=np.array(chosen,dtype=np.float32)
+            last_gray=gray
+    return [observations[i] for i in range(len(samples))]
+
+
+def _face_crop_plan(source, start, duration, src_w, src_h):
+    """Check every frame for shot changes; detect and track faces at 4 Hz.
+
+    Decode through a temporary small video. Retain only sparse gray frames
+    (about 55 MB for 60 seconds of landscape footage); all work stays local.
+    """
+    if src_w * H <= src_h * W:
+        return [(0., .5)], {"coverage": 1., "shots": 1}
     import cv2
     import numpy as np
-
-    # Each render gets its own detector: OpenCV inference objects are mutable
-    # and simultaneous customer jobs must not share their input dimensions.
-    detector = None
-    try:
-        if FACE_MODEL.is_file():
-            detector = cv2.FaceDetectorYN.create(str(FACE_MODEL), "", (640, 360), .8, .3, 1000)
-    except Exception as e:
-        print(f"    [smart-crop] foreground detector unavailable: {type(e).__name__}")
-    cascade = _get_face_cascade() if detector is None else None
-    if detector is None and cascade is None:
-        return 0.5
-
-    n_samples = 5
-    # Sample points spread across the interior of the window (avoid start
-    # and end edges where the DJ may be walking on/off).
-    if duration <= 1.0:
-        ts = [start + duration / 2]
-    else:
-        step = duration / (n_samples + 1)
-        ts = [start + step * (i + 1) for i in range(n_samples)]
-
-    hits = []
-
-    for t in ts:
-        # Lossless samples avoid JPEG artifacts changing the detected faces
-        # between the original upload and its compressed per-clip cache.
+    detector=cv2.FaceDetectorYN.create(str(FACE_MODEL),"",(640,360),.8,.3,1000)
+    observations,cuts,shots=[],[],[[]]
+    with tempfile.TemporaryDirectory(prefix="reelcrate-track-") as folder:
+        sample=str(Path(folder)/"tracking.mp4")
+        subprocess.run(["ffmpeg","-nostdin","-v","error","-y","-ss",str(start),
+                        "-t",str(duration),"-i",source,"-an","-vf","scale=640:-2,setsar=1",
+                        "-c:v","libx264","-preset","ultrafast","-crf","18",sample],
+                       check=True,capture_output=True,timeout=max(45,duration*2))
+        capture=cv2.VideoCapture(sample)
         try:
-            proc = subprocess.run(
-                ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-                 "-ss", f"{t:.2f}", "-i", source,
-                 "-frames:v", "1", "-vf", "scale=640:-2",
-                 "-threads", "1", "-f", "image2pipe", "-vcodec", "png", "-"],
-                capture_output=True, timeout=8
-            )
-            buf = proc.stdout
-            if not buf:
-                continue
-            arr = np.frombuffer(buf, dtype=np.uint8)
-            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if img is None:
-                continue
-            fh, fw = img.shape[:2]
-            if detector is not None:
-                detector.setInputSize((fw, fh))
-                _, detected = detector.detect(img)
-                faces = [] if detected is None else detected[:, :4]
-            else:
-                gray = cv2.equalizeHist(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
-                faces = cascade.detectMultiScale(
-                    gray, scaleFactor=1.15, minNeighbors=4, minSize=(40, 40))
-            for (x, y, w, h) in faces:
-                # Weight by area — a big DJ face matters more than a
-                # tiny background one — and by centrality on Y (skip
-                # ceiling / floor false-positives).
-                area = float(w * h)
-                cy = (y + h / 2) / fh
-                y_weight = 1.0 - abs(cy - 0.45) * 1.2  # peak near eye-line
-                y_weight = max(0.15, y_weight)
-                weight = area * y_weight
-                cx = (x + w / 2) / fw
-                hits.append((float(cx), area, float(weight)))
-        except Exception as e:
-            print(f"    [smart-crop] sample at {t:.1f}s failed: {e}")
-            continue
+            fps=capture.get(cv2.CAP_PROP_FPS) or 30
+            previous=previous_hist=None;last_detection=-1.;index=0
+            while True:
+                ok,frame=capture.read()
+                if not ok:
+                    break
+                t=index/fps;index+=1
+                if t>=duration:
+                    break
+                small=cv2.resize(frame,(64,36))
+                hist=cv2.calcHist([small],[0,1,2],None,[8,8,8],[0,256]*3)
+                cv2.normalize(hist,hist)
+                cut=previous is not None and (
+                    float(np.mean(cv2.absdiff(small,previous)))>32 and
+                    cv2.compareHist(previous_hist,hist,cv2.HISTCMP_BHATTACHARYYA)>.35)
+                previous,previous_hist=small,hist
+                if cut:
+                    cuts.append(t);shots.append([])
+                if not cut and t-last_detection<.25 and t<duration-1/fps:
+                    continue
+                last_detection=t
+                fh,fw=frame.shape[:2];detector.setInputSize((fw,fh))
+                _,detected=detector.detect(frame)
+                faces=[] if detected is None else list(detected[:,:4])
+                shots[-1].append((t,cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY),faces))
+        finally:
+            capture.release()
+    for shot in shots:
+        if shot:
+            observations.extend(_track_shot(shot,640))
+    coverage=sum(o[1] is not None for o in observations)/max(1,len(observations))
+    plan=_crop_track(observations,duration,min(1.,src_h*W/H/src_w),cuts)
+    info={"coverage":round(coverage,3),"shots":len(cuts)+1,"samples":len(observations),
+          "moving":bool(plan and max(x for _,x in plan)-min(x for _,x in plan)>.01)}
+    print(f"    [smart-crop] {'tracked' if plan else 'wide fallback'}: {info}")
+    return plan,info
 
-    fx = _foreground_face_center(hits)
-    print(f"    [smart-crop] face_x_frac={fx:.3f} from {len(hits)} face observations")
-    return fx
+
+def _flow_face_box(previous_gray, gray, box):
+    """Follow an occluded head briefly using consistent local pixel motion."""
+    if previous_gray is None:
+        return None
+    import cv2
+    import numpy as np
+    x,y,w,h=box;fh,fw=gray.shape
+    mask=np.zeros_like(gray)
+    mask[max(0,int(y-h*.3)):min(fh,int(y+h*1.5)),
+         max(0,int(x-w*.2)):min(fw,int(x+w*1.2))]=255
+    points=cv2.goodFeaturesToTrack(previous_gray,60,.015,5,mask=mask)
+    if points is None or len(points)<6:
+        return None
+    moved,status,error=cv2.calcOpticalFlowPyrLK(previous_gray,gray,points,None,winSize=(21,21),maxLevel=3)
+    if moved is None:
+        return None
+    returned,back_status,_=cv2.calcOpticalFlowPyrLK(gray,previous_gray,moved,None,winSize=(21,21),maxLevel=3)
+    if returned is None:
+        return None
+    valid=(status.ravel()==1)&(back_status.ravel()==1)&(error.ravel()<30)&(np.linalg.norm(returned-points,axis=2).ravel()<1.5)
+    if valid.sum()<6:
+        return None
+    delta=(moved-points).reshape(-1,2)[valid]
+    dx,dy=np.median(delta,axis=0)
+    if np.median(np.linalg.norm(delta-[dx,dy],axis=1))>10 or abs(dx)>fw*.18 or abs(dy)>fh*.18:
+        return None
+    return np.array([max(0,min(fw-w,x+dx)),max(0,min(fh-h,y+dy)),w,h],dtype=np.float32)
+
+
+def _select_foreground_face(faces, previous_center, frame_width, previous_area=None):
+    """Track one prominent subject; never average them with the crowd."""
+    if previous_area is not None:
+        faces=[f for f in faces if previous_area*.45 <= f[2]*f[3] <= previous_area*2.5
+               and abs((f[0]+f[2]/2)/frame_width-previous_center)<.15]
+    if not faces:
+        return None
+    largest = max(faces, key=lambda f: f[2]*f[3])
+    eligible = [f for f in faces if f[2]*f[3] >= largest[2]*largest[3]*.65]
+    return largest if previous_center is None else min(
+        eligible, key=lambda f: abs((f[0]+f[2]/2)/frame_width-previous_center))
+
 
 # Visualizer styles, cycled by clip rank so each clip in a batch gets a different look.
 # Each style returns an ffmpeg filter chain that produces a [wave] labeled output,
@@ -326,15 +400,21 @@ def _render_clip(source, clip, out_path, watermark, visualizer,
         if line.startswith("width="):  src_w = int(line.split("=", 1)[1] or 0)
         if line.startswith("height="): src_h = int(line.split("=", 1)[1] or 0)
 
-    # If we have a landscape video, run face detection on 3-5 sample frames
-    # and figure out where the crowd/DJ/dancers are. Falls back to center if
-    # no faces found or if OpenCV isn't installed.
+    # Follow movement and restart the track when the shot changes.
+    crop_plan = None
     face_x_frac = 0.5  # 0..1 horizontal center of interest in source frame
     if has_video and framing == "crop" and src_w > 0 and src_h > 0:
         try:
-            face_x_frac = _find_face_center_x(source, start, duration, src_w, src_h)
+            crop_plan, tracking = _face_crop_plan(source, start, duration, src_w, src_h)
+            clip["tracking"] = tracking
+            face_x_frac = crop_plan[0][1] if crop_plan else None
         except Exception as e:
-            print(f"    [smart-crop] face detection failed, using center: {e}")
+            print(f"    [smart-crop] face detection failed, keeping full frame: {e}")
+            face_x_frac = None
+        if face_x_frac is None:
+            framing = "fit"
+            face_x_frac = .5
+    clip["framing_applied"] = framing
 
     # Always split the audio stream: one copy for the foreground waveform,
     # one copy for the fullscreen backdrop (or drained, if the source has video).
@@ -355,30 +435,21 @@ def _render_clip(source, clip, out_path, watermark, visualizer,
             f"[blur][fit]overlay=(W-w)/2:(H-h)/2-170,setsar=1[bg]"
         )
     elif has_video:
-        # Scale-and-crop the source video to 9:16 centered on face_x_frac.
-        #
-        # Compute the crop offset as a LITERAL INTEGER in Python rather than
-        # an ffmpeg expression. The previous version used
-        #   crop=1080:1920:max(0,min(iw-1080,iw*0.841-540)):(ih-1920)/2
-        # which broke because the outer filter_complex parser reads unescaped
-        # commas as filter separators — nested `,` inside min()/max() made
-        # ffmpeg lose the plot and error out with `Filter not found`.
-        # Since we know src_w / src_h from ffprobe, we can figure out exactly
-        # what the scaled width will be and hand ffmpeg a bare integer.
+        # Scale to fill the phone frame and follow the time-varying crop.
         if src_w > 0 and src_h > 0 and src_w * H > src_h * W:
             # Landscape: scale=-2:H (height fixed at H, width scales up).
             scaled_w = int(round(src_w * H / src_h))
             if scaled_w % 2:                # -2 rounds to even
                 scaled_w -= 1
             target_x  = int(scaled_w * face_x_frac)
-            crop_x_px = max(0, min(scaled_w - W, target_x - W // 2))
+            crop_x_px = _crop_expression(crop_plan, scaled_w) if crop_plan else str(max(0, min(scaled_w - W, target_x - W // 2)))
         else:
             # Portrait / square: scale to W wide → no horizontal shift possible.
             crop_x_px = 0
         video_chain = (
             f"{audio_split}"
             f"[0:v]scale=w='if(gt(a,{W}/{H}),-2,{W})':h='if(gt(a,{W}/{H}),{H},-2)',"
-            f"crop={W}:{H}:{crop_x_px}:(ih-{H})/2,"
+            f"crop={W}:{H}:x='{crop_x_px}':y=(ih-{H})/2,"
             f"setsar=1,"
             f"eq=brightness=-0.05:saturation=1.1[bg]"
             # [abg] is unused in the has_video branch — anullsink drains it.

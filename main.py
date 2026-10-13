@@ -98,7 +98,7 @@ async def lifespan(app):
         stop.set()
         await asyncio.to_thread(worker.join, 12)
 
-app = FastAPI(title="Reelcrate API", version="0.7.3", lifespan=lifespan)
+app = FastAPI(title="Reelcrate API", version="0.7.4", lifespan=lifespan)
 app.add_exception_handler(stripe.error.StripeError, stripe_error_handler)
 
 @app.middleware('http')
@@ -338,7 +338,9 @@ async def process_job(job_id: str, source_path: Path, genre: str,
                 "genre_match": c.get("genre_match", True),
                 "bpm_octave_adjusted": c.get("bpm_octave_adjusted", False),
                 "show_caption": show_caption,
-                "framing": framing,
+                "framing": local_clip.get("framing_applied", c.get("framing_applied", framing)),
+                "framing_requested": framing,
+                "tracking": local_clip.get("tracking", c.get("tracking", {})),
                 "visualizer": visualizer,
                 "watermark": watermark,
                 "hide_logo": hide_logo,
@@ -353,6 +355,9 @@ async def process_job(job_id: str, source_path: Path, genre: str,
         if not rendered:
             raise RuntimeError('No clips could be rendered. Try a different file.')
         warnings = []
+        protected = sum(c.get("framing_requested") == "crop" and c.get("framing") == "fit" for c in rendered)
+        if protected:
+            warnings.append(f"Kept the full shot in {protected} clips because a reliable close-up could not be maintained.")
         if len(rendered) < num_clips:
             warnings.append(f"Made {len(rendered)} of {num_clips} requested clips. Try fewer clips or a wider BPM range. A short set or a failed render can also reduce the total.")
         if any(not c.get("genre_match", True) for c in rendered):
@@ -673,7 +678,7 @@ async def rerender_clip(job_id: str, rank: int, req: RerenderReq,
 
     wm = req.watermark if req.watermark is not None else clip_meta.get("watermark", state.get("watermark", ""))
     viz = req.visualizer or clip_meta.get("visualizer", state.get("visualizer", "freq_bars"))
-    framing = req.framing or clip_meta.get("framing", state.get("framing", "crop"))
+    framing = req.framing or clip_meta.get("framing_requested", clip_meta.get("framing", state.get("framing", "crop")))
     show_caption = req.show_caption if req.show_caption is not None else bool(req.caption.strip())
 
     # Watermark toggle: default to whatever the original job used, override
@@ -713,7 +718,9 @@ async def rerender_clip(job_id: str, rank: int, req: RerenderReq,
     for c in state.get("clips", []):
         if int(c.get("rank", 0)) == rank:
             c["hook"] = local_clip["custom_title"]
-            c.update(watermark=wm, visualizer=viz, framing=framing,
+            c.update(watermark=wm, visualizer=viz,
+                     framing=local_clip.get("framing_applied", framing),
+                     framing_requested=framing, tracking=local_clip.get("tracking", {}),
                      show_caption=show_caption, hide_logo=hide_logo_req)
     write_state(job_id, state)
 

@@ -50,10 +50,18 @@ Local verification uses isolated accounts and a 52-minute 1080p DJ recording; no
 
 ### Foreground framing model
 
-Fill-screen framing uses the small OpenCV YuNet 2023 model to locate faces,
-then favors the larger foreground face over smaller background faces. It samples
-five moments per clip and uses a fixed crop; keep-full-frame remains the default
-for moving cameras, groups, and shots where the decks need to stay visible.
+Follow-the-DJ framing uses the small OpenCV YuNet 2023 model, detecting faces
+four times per second and checking every frame for camera cuts. It follows a
+prominent foreground face with a smoothed crop, restarting on shot changes.
+Pixel-motion tracking bridges brief face occlusions; smaller crowd faces cannot
+replace the foreground subject just because the DJ looks down.
+Long detection gaps, ambiguous framing, or a face too large for the vertical
+window use a full-frame fallback with an explicit result warning. This is the
+phone UI default; Keep full frame is available for groups and showing the decks.
+
+Automatic tags describe energy only. Spectral flux cannot verify a track blend,
+drop, build-up, or audience reaction; the app no longer asserts those events.
+Clip selection includes 40% of the chosen length before the audio peak.
 The detector runs inside this service and does not send frames to another API.
 
 Model: https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet

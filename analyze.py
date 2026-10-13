@@ -295,7 +295,7 @@ def _stream_rms_and_flux(wav_path: str, hop: int = 256, n_fft: int = 1024,
 
 
 def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0,
-                 lead_in_sec: float = 6.0, genre: str = "all",
+                 lead_in_sec: float | None = None, genre: str = "all",
                  variation_seed: int = 0,
                  bpm_min: float = 0, bpm_max: float = 0) -> list[dict]:
     """
@@ -309,6 +309,10 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
       - BPM windows re-read directly from the WAV (never hold full audio in RAM)
     """
     import gc
+
+    # Keep context on both sides of the selected moment at every length.
+    if lead_in_sec is None:
+        lead_in_sec = clip_len_sec * .4
 
     # Resolve the effective BPM filter range. Explicit bpm_min/bpm_max wins.
     # Otherwise fall back to the genre → range mapping (backwards compat with
@@ -455,10 +459,8 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
             if matches:
                 local_bpm = resolved
 
-        # Flux sustain — real DJ transitions have SUSTAINED spectral change
-        # over 5–10s (a mix window). In-track drops spike then decay in <2s.
-        # Compare flux around the peak to flux 8–15s before it: if elevated
-        # persists, it's a mix; if it's a spike, it's a drop.
+        # Retain this descriptive feature for diagnostics. Sustained spectral
+        # change alone does not identify a DJ transition or two tracks.
         pre_lo  = max(0, frame - int(15 * frames_per_sec))
         pre_hi  = max(0, frame - int(8  * frames_per_sec))
         mid_lo  = max(0, frame - int(3  * frames_per_sec))
@@ -678,83 +680,31 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
 # ---------------- Tagging ----------------
 
 HOOK_POOL = {
-    "PEAK": [
-        "this drop hits different",
-        "when the bass took over the room",
-        "watch the energy change at the drop",
-        "this is the moment everyone screamed",
-        "drop of the night",
-        "the second the room went off",
-        "they didn't see this drop coming",
-        "this one stays in the head all week",
-    ],
-    "TRANSITION": [
-        "this transition is illegal",
-        "name a smoother blend",
-        "watch this blend land",
-        "the way these tracks fit together",
-        "this mix is a crime scene",
-        "transition you have to rewind",
-        "two tracks, one perfect blend",
-        "this is the kind of mix you save",
-    ],
-    "BUILD": [
-        "feel that build coming",
-        "the tension before the drop",
-        "wait for it",
-        "you can feel the room hold its breath",
-        "this build was made for the floor",
-        "the calm before the chaos",
-        "patience pays off in three… two…",
-        "the moment before the moment",
+    "ENERGY": [
+        "energy from the booth", "turn this one up", "a moment from the set",
+        "in the mix", "from the decks", "keep the music moving",
+        "sound on", "a little louder",
     ],
     "MOMENT": [
-        "this moment though",
-        "vibes locked in",
-        "the feel of this section",
-        "this is what the booth sees",
-        "energy you can't fake",
-        "this is the part you replay",
-        "captured the vibe right here",
-        "this stretch though",
+        "a moment from the set", "in the mix", "from the booth",
+        "sound on", "a little of the session", "on the decks",
+        "press play", "from this set",
     ],
     "VIBE": [
-        "pure vibe right here",
-        "just let it ride",
-        "this is the cruise mode",
-        "set this on loop",
-        "tap in for a second",
-        "this stretch felt right",
-        "press play and float",
-        "this loop is what summer sounds like",
+        "just let it ride", "in the groove", "press play", "sound on",
+        "from the session", "a moment in the mix", "from the booth", "keep it playing",
     ],
 }
 
 
 def _resolve_tag(c: dict) -> str:
-    """Assign a tag that actually reflects what's happening in the audio.
+    """Describe measured energy without inventing musical events.
 
-    Prior version tagged anything with a flux spike as TRANSITION, so 90 % of
-    in-track drops got mislabeled. Real DJ transitions have SUSTAINED spectral
-    change over a mix window (5-10s) — captured in `flux_sustain`, which is
-    the elevation of flux at the peak relative to 8-15s earlier.
+    Spectral flux cannot prove two tracks are blending, a drop is imminent,
+    or the crowd reacted. Those claims require separate verified evidence.
     """
-    energy   = c.get("energy", 0) or 0
-    flux     = c.get("flux", 0) or 0
-    sustain  = c.get("flux_sustain", 0) or 0
-
-    # Sustain >= 0.15 means the spectrum stayed noticeably different from a
-    # baseline 8-15s earlier — that's a real mix, not a snare hit.
-    if sustain >= 0.15 and flux >= 0.55:
-        return "TRANSITION"
-    # PEAK = high energy + high flux at the moment. In-track drops land here.
-    if flux > 0.75 and energy > 0.65:
-        return "PEAK"
-    if energy > 0.75:
-        return "BUILD"
-    if energy > 0.5:
-        return "MOMENT"
-    return "VIBE"
+    energy = c.get("energy", 0) or 0
+    return "ENERGY" if energy > .75 else "MOMENT" if energy > .5 else "VIBE"
 
 
 def assign_hooks(clips: list[dict]) -> list[dict]:
