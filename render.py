@@ -86,15 +86,18 @@ def _crop_track(observations, duration, crop_width, cuts=()):
     return points
 
 
-def _crop_expression(points, scaled_width):
-    """Piecewise linear motion, evaluated for every output video frame."""
-    positions = [(t, max(0, min(scaled_width-W, x*scaled_width-W/2))) for t,x in points]
-    expression = f"{positions[0][1]:.3f}"
-    for (ta,xa),(tb,xb) in zip(positions,positions[1:]):
-        if abs(xb-xa) < .1:
-            continue
-        expression += f"+({xb-xa:.3f})*clip((t-{ta:.4f})/{max(.0001,tb-ta):.4f},0,1)"
-    return expression
+def _crop_commands(points, scaled_width, duration, path):
+    """Use bounded numeric commands, not an expression growing with duration.
+
+    Long crop expressions are rejected by some production FFmpeg builds.
+    sendcmd applies the interpolated position on each frame without that limit.
+    """
+    import numpy as np
+    times=np.arange(max(1,int(duration*FPS)+1))/FPS
+    centers=np.interp(times,[t for t,_ in points],[x for _,x in points])
+    offsets=np.clip(centers*scaled_width-W/2,0,max(0,scaled_width-W))
+    path.write_text("\n".join(f"{t:.6f} crop@follow x {int(x)};" for t,x in zip(times,offsets)))
+    return int(offsets[0])
 
 
 def _track_shot(samples, frame_width):
@@ -436,20 +439,25 @@ def _render_clip(source, clip, out_path, watermark, visualizer,
         )
     elif has_video:
         # Scale to fill the phone frame and follow the time-varying crop.
+        motion_filter = ""
         if src_w > 0 and src_h > 0 and src_w * H > src_h * W:
             # Landscape: scale=-2:H (height fixed at H, width scales up).
             scaled_w = int(round(src_w * H / src_h))
             if scaled_w % 2:                # -2 rounds to even
                 scaled_w -= 1
             target_x  = int(scaled_w * face_x_frac)
-            crop_x_px = _crop_expression(crop_plan, scaled_w) if crop_plan else str(max(0, min(scaled_w - W, target_x - W // 2)))
+            crop_x_px = max(0,min(scaled_w-W,target_x-W//2))
+            if crop_plan:
+                commands_path = text_dir / "crop-motion.txt"
+                crop_x_px = _crop_commands(crop_plan,scaled_w,duration,commands_path)
+                motion_filter = f"setpts=PTS-STARTPTS,sendcmd=f='{commands_path}',"
         else:
             # Portrait / square: scale to W wide → no horizontal shift possible.
             crop_x_px = 0
         video_chain = (
             f"{audio_split}"
             f"[0:v]scale=w='if(gt(a,{W}/{H}),-2,{W})':h='if(gt(a,{W}/{H}),{H},-2)',"
-            f"crop={W}:{H}:x='{crop_x_px}':y=(ih-{H})/2,"
+            f"{motion_filter}crop@follow={W}:{H}:x={crop_x_px}:y=(ih-{H})/2,"
             f"setsar=1,"
             f"eq=brightness=-0.05:saturation=1.1[bg]"
             # [abg] is unused in the has_video branch — anullsink drains it.
@@ -517,7 +525,7 @@ def _render_clip(source, clip, out_path, watermark, visualizer,
         print("    [ffmpeg error] rendering timed out")
         return False
     if res.returncode != 0:
-        print(f"    [ffmpeg error]\n{res.stderr[-1500:]}")
+        print(f"    [ffmpeg error]\n{res.stderr[:1500]}\n{res.stderr[-1500:] if len(res.stderr)>1500 else ''}")
         return False
     return True
 

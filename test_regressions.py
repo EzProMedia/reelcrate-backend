@@ -469,6 +469,18 @@ def test_new_shot_uses_foreground_evidence_beyond_its_first_frame(monkeypatch):
     assert all(abs(x-100/320)<.001 for _,x,_ in path)
 
 
+def test_crop_commands_preserve_long_motion_paths_without_expression_limits(tmp_path):
+    from render import _crop_commands
+    import math
+    points=[(i*.25,.5+.2*math.sin(i)) for i in range(241)]
+    path=tmp_path/'motion.txt'
+    _crop_commands(points,3412,60,path)
+    lines=path.read_text().splitlines()
+    assert len(lines)==1801 and max(map(len,lines))<45
+    offsets=[int(line.split()[-1].rstrip(';')) for line in lines]
+    assert min(offsets)>=0 and max(offsets)<=2332 and max(offsets)-min(offsets)>1000
+
+
 def test_audio_energy_does_not_invent_transitions_drops_or_crowd_reactions():
     from analyze import assign_hooks
     clips=assign_hooks([dict(energy=e,flux=1.,flux_sustain=1.,peak_sec=i*30)

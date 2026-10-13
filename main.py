@@ -98,7 +98,7 @@ async def lifespan(app):
         stop.set()
         await asyncio.to_thread(worker.join, 12)
 
-app = FastAPI(title="Reelcrate API", version="0.7.4", lifespan=lifespan)
+app = FastAPI(title="Reelcrate API", version="0.7.5", lifespan=lifespan)
 app.add_exception_handler(stripe.error.StripeError, stripe_error_handler)
 
 @app.middleware('http')
