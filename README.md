@@ -34,3 +34,16 @@ Install the requirements plus pytest and httpx, then run `pytest -q test_regress
 ## Rollback
 
 Restore the preceding GitHub commit and republish the prior Netlify deploy together. Keep the data volume intact. The JSON user format remains compatible; the old release ignores the additional outbox database and backup file.
+
+
+## October 2026 clip-quality update (0.7.0)
+
+Upload accepts `show_caption`, `framing=fit|crop`, optional DJ-name `watermark`, and an optional `logo` image (PNG/JPEG/WebP, at most 5 MB and 4096×4096 pixels). Logos are decoded and re-encoded, retain transparency, and persist through caption edits. Existing paid/trial logo restrictions still apply to the Reelcrate badge.
+
+The analyzer uses local tempo with finer timing and periodicity confidence. BPM filters exclude uncertain and out-of-range candidates; half/double interpretations are reported consistently. Some ranges legitimately produce fewer clips. Do not describe inferred BPM as certified track metadata. Short or silent recordings cannot produce an arbitrary number of distinct clips.
+
+The renderer preserves the full frame by default, offers a crop option, protects text from filter-syntax injection, keeps captions inside a safer posting area, and fixes invisible waveform and end-of-stream failures. Source audio remains unnormalized stereo; loudness and copyrighted music/platform rights are not changed.
+
+The separate Netlify frontend supplies five animated visualizer previews made from a synthetic test beat, actual upload progress, custom-branding controls, last-job recovery and one private ZIP download. Placeholder stats, unsupported post scheduling and disconnected edit-style controls are removed.
+
+Local verification uses isolated accounts and a 52-minute 1080p DJ recording; no demo media, customer records, credentials or test accounts belong in this repository. The unit suite covers known beat rates, noise confidence, chunk alignment, settings gates, logo validation, signed ZIP downloads and caption edits. Full render testing must additionally check output counts, durations, playback and audio. Actual iPhone/Android device testing and concurrent-user capacity testing remain separate from a desktop browser at phone size.

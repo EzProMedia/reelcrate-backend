@@ -95,20 +95,60 @@ def _bass_filter(y: np.ndarray, sr: int, cutoff_hz: float = 250.0) -> np.ndarray
         return y
 
 
+def _tempo_candidates(envelope, sr, hop=128):
+    """Autocorrelation peaks with sub-frame interpolation, not coarse tempo bins."""
+    if len(envelope) < 64 or float(np.max(envelope)) < 1e-4:
+        return []
+    ac = librosa.autocorrelate(envelope, max_size=int(sr / hop * 60 / 30) + 2)
+    ac = ac / max(float(ac[0]), 1e-10)
+    peaks, _ = find_peaks(ac)
+    candidates = []
+    for k in peaks:
+        if not 30 <= 60 * sr / hop / k <= 220:
+            continue
+        denominator = ac[k-1] - 2 * ac[k] + ac[k+1]
+        shift = .5 * (ac[k-1] - ac[k+1]) / denominator if abs(denominator) > 1e-10 else 0
+        bpm = 60 * sr / hop / (k + np.clip(shift, -.5, .5))
+        prior = np.exp(-.5 * (np.log2(bpm / 120) / .7) ** 2)
+        candidates.append((float(bpm), float(ac[k]), float(ac[k] * (.9 + .1 * prior))))
+    return sorted(candidates, key=lambda c: -c[2])
+
+
 def _stable_bpm(y_bass: np.ndarray, sr: int) -> tuple[float, float]:
-    """Detect BPM on bass-filtered audio. Returns (bpm, confidence).
-    Confidence is 0..1: higher = more consistent across short windows."""
+    """Estimate local tempo and rhythmic evidence. Noise is not a confident beat.
+
+    128-sample hops plus interpolated lag avoid quantizing e.g. 128 to 129.2.
+    Competing non-octave rhythms and changing tempo reduce confidence.
+    Half/double beat interpretation remains inherently ambiguous for some music.
+    """
     try:
-        # Aggregate=None gives per-frame tempo estimates → check stability
-        tempo_curve = librosa.feature.tempo(y=y_bass, sr=sr, aggregate=None)
-        if tempo_curve is None or len(tempo_curve) == 0:
+        envelope = librosa.onset.onset_strength(y=y_bass, sr=sr, hop_length=128, n_fft=1024)
+        envelope = np.maximum(0, envelope - np.median(envelope))
+        candidates = _tempo_candidates(envelope, sr)
+        if not candidates:
             return 0.0, 0.0
-        median_bpm = float(np.median(tempo_curve))
-        # Confidence = fraction of estimates within ±5 BPM of median
-        agreement = float(np.mean(np.abs(tempo_curve - median_bpm) <= 5))
-        return median_bpm, agreement
+        bpm, strength, score = candidates[0]
+        confidence = float(np.clip((strength - .15) / .45, 0, 1))
+        # Strong competing rhythms that aren't the same beat at half/double time
+        # make a single number unreliable (often a transition or syncopation).
+        for other, _, other_score in candidates[1:]:
+            same_beat = min(abs(other / (bpm * factor) - 1) for factor in (.25, 1/3, .5, 1, 2, 3, 4)) < .035
+            if not same_beat and other_score > score * .92:
+                confidence = min(confidence, .45)
+        n = len(envelope)
+        for window in (envelope[:n*2//3], envelope[n//3:]):
+            local = _tempo_candidates(window, sr)
+            if local and min(abs(local[0][0] / (bpm * factor) - 1) for factor in (.25, 1/3, .5, 1, 2, 3, 4)) > .035:
+                confidence = min(confidence, .4)
+        return bpm, confidence
     except Exception:
         return 0.0, 0.0
+
+
+def _bpm_for_range(bpm, lo, hi):
+    """Return the beat interpretation actually used by the selected range."""
+    return next((candidate for candidate in (bpm, bpm * 2, bpm / 2)
+                 if lo <= candidate <= hi), 0.0)
 
 
 def _local_bpm(y, sr, peak_sec: float, window_sec: float = 15.0) -> tuple[float, float]:
@@ -206,27 +246,24 @@ def _stream_rms_and_flux(wav_path: str, hop: int = 256, n_fft: int = 1024,
     with sf.SoundFile(wav_path) as f:
         sr = f.samplerate
         total_frames = f.frames
-        chunk_frames = int(chunk_sec * sr)
-
+        # Align chunks to the analysis grid and retain half a window at each
+        # seam. Every frame maps to exactly frame * hop / sr, even in long sets.
+        chunk_frames = max(hop, int(chunk_sec * sr) // hop * hop)
+        half = n_fft // 2
         for offset in range(0, total_frames, chunk_frames):
-            f.seek(offset)
-            chunk = f.read(chunk_frames, dtype="float32", always_2d=False)
-            if chunk.size == 0:
-                break
-
-            # RMS on this chunk
-            r = librosa.feature.rms(y=chunk, hop_length=hop)[0]
+            count = (min(chunk_frames, total_frames - offset) + hop - 1) // hop
+            left = offset - half
+            right = offset + (count - 1) * hop + half
+            f.seek(max(0, left))
+            chunk = f.read(min(total_frames, right) - max(0, left), dtype="float32")
+            chunk = np.pad(chunk, (max(0, -left), max(0, right-total_frames)))
+            S = np.abs(librosa.stft(chunk, hop_length=hop, n_fft=n_fft, center=False))
+            r = librosa.feature.rms(S=S, frame_length=n_fft, hop_length=hop)[0]
             rms_parts.append(r)
-
-            # STFT + spectral flux on this chunk. Prepend previous last column so
-            # the diff between chunks doesn't produce a bogus spike at the seam.
-            S = np.abs(librosa.stft(chunk, hop_length=hop, n_fft=n_fft))
-            if prev_last_col is not None:
-                S = np.hstack([prev_last_col[:, None], S])
+            previous = prev_last_col if prev_last_col is not None else S[:, 0]
+            fl = np.maximum(0, np.diff(S, axis=1, prepend=previous[:, None])).sum(axis=0)
             prev_last_col = S[:, -1].copy()
-            fl = np.maximum(0, np.diff(S, axis=1)).sum(axis=0)
             flux_parts.append(fl)
-
             del chunk, S, r, fl
             gc.collect()
 
@@ -281,6 +318,11 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
     rms, flux, sr, duration = _stream_rms_and_flux(main_wav, hop=hop, n_fft=n_fft)
     frame_sec = hop / sr
 
+    if duration < 1 or not rms.size or float(np.max(rms)) < 0.0001:
+        for tmp in (main_wav, bass_wav):
+            Path(tmp).unlink(missing_ok=True)
+        raise ValueError("This file has no usable audio. Try a recording with music.")
+    num_clips = max(1, min(num_clips, int(duration // clip_len_sec)))
     if duration < clip_len_sec * 2:
         print(f"[warn] track is short ({duration:.1f}s); reducing num_clips")
         num_clips = max(1, min(num_clips, int(duration // clip_len_sec)))
@@ -306,14 +348,14 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
     score[rms_smooth < noise_floor] = 0
 
     # 4) Edge guard: don't pick peaks too close to start/end
-    edge_frames = int(clip_len_sec / frame_sec)
+    edge_frames = int(min(clip_len_sec, duration / 4) / frame_sec)
     score[:edge_frames] = 0
     score[-edge_frames:] = 0
 
     # 5) Find peaks with min separation = clip_len_sec (non-overlapping clips).
     # Find MORE candidates than num_clips so genre filter has room to work.
     min_distance_frames = int(clip_len_sec / frame_sec)
-    candidate_pool = max(num_clips * 4, 15)  # find at least 15 candidates
+    candidate_pool = max(num_clips * 10, 100)  # find at least 15 candidates
     peaks_idx, props = find_peaks(
         score,
         distance=min_distance_frames,
@@ -333,7 +375,12 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
 
     # 6) Rank candidate peaks by score
     peak_scores = score[peaks_idx]
-    ranked_candidates = sorted(zip(peaks_idx, peak_scores), key=lambda x: -x[1])[:candidate_pool]
+    ranked_all = sorted(zip(peaks_idx, peak_scores), key=lambda x: -x[1])
+    ranked_candidates = ranked_all[:candidate_pool]
+    for zone in range(num_clips):
+        zonal = [(f, v) for f, v in ranked_all
+                 if min(num_clips-1, int(f * frame_sec / duration * num_clips)) == zone][:3]
+        ranked_candidates += [c for c in zonal if c not in ranked_candidates]
 
     # 7) Global BPM: sample three 30s windows from the bass WAV and pick the
     # most confident tempo. Cheap (~1 MB per window) and avoids loading the
@@ -358,8 +405,8 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
 
     # 8) Compute local BPM around each candidate peak (window read directly
     # from the bass WAV — never holds the full track in RAM).
-    def _local_bpm_streamed(peak_sec: float, window_sec: float = 15.0) -> tuple[float, float]:
-        start = max(0.0, peak_sec - window_sec / 2)
+    def _local_bpm_streamed(peak_sec: float, window_sec: float = 30.0) -> tuple[float, float]:
+        start = max(0.0, peak_sec - lead_in_sec)
         y_win, wsr = _read_wav_window(bass_wav, start, window_sec)
         if y_win.size < wsr * 2:
             return 0.0, 0.0
@@ -372,7 +419,7 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
     # genre match. Room-mic recordings often produce wobbly BPMs; we'd rather
     # demote a low-confidence peak to the "secondary" pool than let a bogus
     # BPM either pass or fail the genre check erroneously.
-    GENRE_MATCH_MIN_CONF = 0.30
+    GENRE_MATCH_MIN_CONF = 0.55
 
     # Frames per second (of analysis grid) used below for flux windowing.
     frames_per_sec = 1.0 / frame_sec
@@ -381,21 +428,15 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
     for frame, sc in ranked_candidates:
         peak_sec = float(frame * frame_sec)
         local_bpm, local_conf = _local_bpm_streamed(peak_sec)
-        used_global = False
-        if local_bpm == 0.0:
-            local_bpm, local_conf = global_bpm, global_conf
-            used_global = True
-
-        # A "trusted" BPM has to (a) come from the local window with at least
-        # some agreement, or (b) fall back to the global tempo which we already
-        # verified against three set-wide probes.
-        trusted = (local_conf >= GENRE_MATCH_MIN_CONF) or (used_global and global_conf >= 0.45)
+        raw_local_bpm = local_bpm
+        trusted = local_conf >= GENRE_MATCH_MIN_CONF
         if not filter_active:
             matches = True
-        elif not trusted:
-            matches = False   # low-confidence BPMs never count as matches
         else:
-            matches = _bpm_in_range(local_bpm, eff_lo, eff_hi)
+            resolved = _bpm_for_range(local_bpm, eff_lo, eff_hi) if trusted else 0.0
+            matches = bool(resolved)
+            if matches:
+                local_bpm = resolved
 
         # Flux sustain — real DJ transitions have SUSTAINED spectral change
         # over 5–10s (a mix window). In-track drops spike then decay in <2s.
@@ -415,6 +456,7 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
         candidates_with_meta.append({
             "frame": frame, "score": sc, "peak_sec": peak_sec,
             "local_bpm": local_bpm, "local_bpm_confidence": local_conf,
+            "raw_local_bpm": raw_local_bpm,
             "flux_sustain": flux_sustain,
             "genre_match": matches,
         })
@@ -432,24 +474,13 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
                           key=lambda c: -c["score"])
     fallback_used = False
 
-    if not filter_active:
-        primary_pool   = matching + non_matching  # no filter → everything is a match
-        secondary_pool = []
-    elif len(matching) == 0:
-        # No matches at all — genuine fallback so user still gets clips.
-        print(f"[warn] no moments in BPM range [{eff_lo:.0f}, {eff_hi:.0f}]. "
-              f"Falling back to full set.")
-        primary_pool   = non_matching
-        secondary_pool = []
-        fallback_used  = True
-    else:
-        # Matching pool has priority. Non-matching only fills leftover slots.
-        primary_pool   = matching
-        secondary_pool = non_matching
-        if len(matching) < num_clips:
-            print(f"[warn] only {len(matching)} moments in [{eff_lo:.0f}, "
-                  f"{eff_hi:.0f}] BPM; padding with {num_clips - len(matching)} best overall.")
-            fallback_used = True
+    # A BPM filter is strict. Never fill requested slots with the wrong tempo.
+    primary_pool = matching if filter_active else matching + non_matching
+    secondary_pool = []
+    if filter_active and not primary_pool:
+        for tmp in (main_wav, bass_wav):
+            Path(tmp).unlink(missing_ok=True)
+        raise ValueError("No confident moments in this BPM range. Choose All BPMs or a wider range.")
 
     # Minimum spacing between picked clips — bumped from 90s to 180s because
     # 90s wasn't enough on dense sets (multiple drops per section clustered).
@@ -528,7 +559,7 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
 
         # Wider pool so the spacing filter has room to work.
         pool_size = min(len(pool), max(k * 4, k + 8))
-        sub = list(pool[:pool_size])
+        sub = [c for c in pool if c not in picked][:pool_size]
 
         if seed:
             import random as _random
@@ -617,6 +648,7 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
             "bpm": round(global_bpm, 1),
             "bpm_confidence": round(global_conf, 2),
             "local_bpm": round(c["local_bpm"], 1),
+            "bpm_octave_adjusted": abs(c["local_bpm"] - c["raw_local_bpm"]) > 1,
             "local_bpm_confidence": round(c["local_bpm_confidence"], 2),
             "genre_match": bool(c["genre_match"]),
             "genre_requested": genre,

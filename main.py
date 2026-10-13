@@ -17,6 +17,9 @@ Container:
 
 import asyncio
 import json
+import math
+import tempfile
+import zipfile
 import re
 from contextlib import asynccontextmanager
 import os
@@ -32,7 +35,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from reliability import start_mail_worker, queue_email, rate_limit
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
 # Engine modules live alongside this file (flat layout for simpler deploys).
 sys.path.insert(0, str(Path(__file__).parent))
@@ -94,7 +98,7 @@ async def lifespan(app):
         stop.set()
         await asyncio.to_thread(worker.join, 12)
 
-app = FastAPI(title="Reelcrate API", version="0.6.0", lifespan=lifespan)
+app = FastAPI(title="Reelcrate API", version="0.7.0", lifespan=lifespan)
 
 @app.middleware('http')
 async def limit_auth_attempts(request: Request, call_next):
@@ -202,7 +206,8 @@ async def process_job(job_id: str, source_path: Path, genre: str,
                       visualizer: str, num_clips: int, clip_length: int,
                       watermark: str, variation_seed: int = 0,
                       bpm_min: float = 0, bpm_max: float = 0,
-                      hide_logo: bool = False) -> None:
+                      hide_logo: bool = False, show_caption: bool = True,
+                      framing: str = "fit") -> None:
     """Run analyze + render in a worker thread. Updates job state as it goes."""
     out_dir = job_dir(job_id)
     state = read_state(job_id) or {}
@@ -270,6 +275,7 @@ async def process_job(job_id: str, source_path: Path, genre: str,
                 )
                 cache_ok = True
             except Exception as e:
+                clip_src.unlink(missing_ok=True)
                 print(f"[warn] could not cache clip source for rank {c['rank']}: {e}")
 
             # Fallback audio-only cache — used only if the MP4 cut failed above.
@@ -285,6 +291,7 @@ async def process_job(job_id: str, source_path: Path, genre: str,
                         check=True,
                     )
                 except Exception as e2:
+                    clip_audio.unlink(missing_ok=True)
                     print(f"[warn] could not cache audio-only either: {e2}")
 
             # Timestamps in `c` reference the ORIGINAL source. For the render
@@ -309,11 +316,13 @@ async def process_job(job_id: str, source_path: Path, genre: str,
                     lambda picked=_pick_source(): render_clip(
                         picked[0], lc if picked[1] else c,
                         p, watermark, visualizer,
-                        hide_logo=hide_logo,
+                        hide_logo=hide_logo, show_caption=show_caption, framing=framing,
+                        logo_path=str(out_dir / "dj-logo.png") if (out_dir / "dj-logo.png").exists() else None,
                     )
                 )(),
             )
             if not ok:
+                out_path.unlink(missing_ok=True)
                 continue
             rendered.append({
                 "rank": c["rank"],
@@ -321,7 +330,18 @@ async def process_job(job_id: str, source_path: Path, genre: str,
                 "hook": c["hook"],
                 "bpm": c.get("bpm"),
                 "local_bpm": c.get("local_bpm"),
-                "duration_sec": clip_length,
+                "bpm_confidence": c.get("bpm_confidence", 0),
+                "local_bpm_confidence": c.get("local_bpm_confidence", 0),
+                "start_sec": c["start_sec"],
+                "end_sec": c["end_sec"],
+                "genre_match": c.get("genre_match", True),
+                "bpm_octave_adjusted": c.get("bpm_octave_adjusted", False),
+                "show_caption": show_caption,
+                "framing": framing,
+                "visualizer": visualizer,
+                "watermark": watermark,
+                "hide_logo": hide_logo,
+                "duration_sec": round(c["end_sec"] - c["start_sec"], 2),
                 "url": f"/api/clips/{job_id}/clip_{c['rank']:02d}.mp4",
             })
             pct = 20 + int(75 * (i + 1) / len(clips))
@@ -331,11 +351,17 @@ async def process_job(job_id: str, source_path: Path, genre: str,
 
         if not rendered:
             raise RuntimeError('No clips could be rendered. Try a different file.')
+        warnings = []
+        if len(rendered) < num_clips:
+            warnings.append(f"Made {len(rendered)} of {num_clips} requested clips. Try fewer clips or a wider BPM range. A short set or a failed render can also reduce the total.")
+        if any(not c.get("genre_match", True) for c in rendered):
+            warnings.append("Some clips are outside your BPM range because there were not enough confident matches. Tempo is an estimate.")
         # --- Done ---
         state.update({
             "status": "done",
             "progress": 100,
             "message": "Ready",
+            "warnings": warnings,
             "clips": rendered,
             "finished_at": time.time(),
         })
@@ -343,7 +369,7 @@ async def process_job(job_id: str, source_path: Path, genre: str,
 
     except Exception as e:
         state.update({"status": "failed", "progress": 100,
-                      "message": f"Engine error: {type(e).__name__}: {e}"})
+                      "message": str(e) if isinstance(e, ValueError) else "We could not process this recording. Please try a different audio or video file."})
         write_state(job_id, state)
         # On failure, also delete the source so we don't hold onto GB of nothing.
         try: source_path.unlink()
@@ -369,11 +395,14 @@ async def healthz():
 @app.post("/api/upload")
 async def upload(
     file: UploadFile = File(...),
+    logo: Optional[UploadFile] = File(None),
     genre: str = Form("all"),
     visualizer: str = Form("freq_bars"),
     num_clips: int = Form(DEFAULT_NUM_CLIPS),
     clip_length: int = Form(DEFAULT_CLIP_LENGTH),
-    watermark: str = Form("@realdjez1"),
+    watermark: str = Form(""),
+    show_caption: bool = Form(True),
+    framing: str = Form("fit"),
     variation_seed: int = Form(0),               # 0 = deterministic; >0 = randomize picks
     bpm_min: float = Form(0),                    # explicit BPM range (preferred over genre)
     bpm_max: float = Form(0),
@@ -413,6 +442,15 @@ async def upload(
     if not (10 <= clip_length <= 90):
         raise HTTPException(400, "clip_length out of range (10-90 sec)")
 
+    if framing not in ("fit", "crop"):
+        raise HTTPException(400, "Choose Keep full frame or Fill screen")
+    if len(watermark) > 40 or any(ord(c) < 32 for c in watermark):
+        raise HTTPException(400, "DJ name must be 40 characters or fewer, on one line")
+    if not (math.isfinite(bpm_min) and math.isfinite(bpm_max)) or not (
+        (bpm_min == 0 and bpm_max == 0) or 30 <= bpm_min < bpm_max <= 220
+    ):
+        raise HTTPException(400, "Choose a BPM range between 30 and 220")
+
     # Run cleanup FIRST so we have room. Then check we actually have space.
     cleanup_old_jobs()
     emergency_cleanup()
@@ -424,12 +462,33 @@ async def upload(
            if d.is_dir() and read_state(d.name)):
         raise HTTPException(429, 'Another set is processing. Please try again shortly.')
 
+    # Decode logos before starting the job. Re-encoding removes metadata and
+    # rejects malformed/oversized images; no remote URLs or SVG scripts accepted.
+    logo_image = None
+    if logo is not None and logo.filename:
+        from PIL import Image, UnidentifiedImageError
+        import io
+        data = await logo.read(5 * 1024 * 1024 + 1)
+        if len(data) > 5 * 1024 * 1024:
+            raise HTTPException(400, 'Logo must be smaller than 5 MB')
+        try:
+            candidate = Image.open(io.BytesIO(data))
+            if candidate.format not in ('PNG', 'JPEG', 'WEBP') or max(candidate.size) > 4096:
+                raise ValueError('Unsupported logo')
+            candidate.load()
+            logo_image = candidate.convert('RGBA')
+            logo_image.thumbnail((800, 800))
+        except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError):
+            raise HTTPException(400, 'Choose a PNG, JPG or WebP logo up to 4096 pixels wide and tall')
+
     # Create job dir; stream the upload to disk so we can handle big files.
     job_id = str(uuid.uuid4())
     out_dir = job_dir(job_id)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     write_state(job_id, {'job_id': job_id, 'status': 'uploading', 'owner_email': user_email})
+    if logo_image is not None:
+        logo_image.save(out_dir / "dj-logo.png")
     suffix = Path(file.filename or "set.mp4").suffix or ".mp4"
     source_path = out_dir / f"source{suffix}"
     size = 0
@@ -473,7 +532,10 @@ async def upload(
         "num_clips": num_clips,
         "clip_length": clip_length,
         "hide_logo": hide_logo,
-        "watermark": watermark,
+        "watermark": watermark.strip(),
+        "show_caption": show_caption,
+        "framing": framing,
+        "has_custom_logo": logo_image is not None,
         "started_at": time.time(),
         "owner_email": user_email,
     }
@@ -487,7 +549,7 @@ async def upload(
         job_id, source_path, genre, visualizer, num_clips, clip_length, watermark,
         variation_seed=variation_seed,
         bpm_min=bpm_min, bpm_max=bpm_max,
-        hide_logo=hide_logo,
+        hide_logo=hide_logo, show_caption=show_caption, framing=framing,
     ))
 
     return JSONResponse({"job_id": job_id, "status_url": f"/api/jobs/{job_id}"})
@@ -506,13 +568,47 @@ async def job_status(job_id: str, user_email: str = Depends(current_user)):
         filename = f"clip_{int(clip['rank']):02d}.mp4"
         ticket = make_token(job_id + '/' + filename, ttl=6*3600, kind='clip')
         clip['url'] = f'/api/clips/{job_id}/{filename}?ticket={ticket}'
+    archive_ticket = make_token(job_id + '/clips.zip', ttl=6*3600, kind='clip')
+    state['download_url'] = f'/api/downloads/{job_id}?ticket={archive_ticket}'
     return state
 
 
+@app.get("/api/downloads/{job_id}")
+async def download_all(job_id: str, ticket: str = ''):
+    from auth import verify_token
+    if verify_token(ticket, expect_kind='clip') != job_id + '/clips.zip':
+        raise HTTPException(401, 'Open your clips again to refresh this download link')
+    state = read_state(job_id)
+    if not state:
+        raise HTTPException(404, 'These clips have expired. Upload your set again.')
+    if state.get('status') != 'done':
+        raise HTTPException(409, 'Please wait for your clips to finish')
+    def make_archive():
+        # Stored MP4s are already compressed. A disk file keeps RAM bounded.
+        fd, name = tempfile.mkstemp(suffix='.zip', prefix='reelcrate-')
+        os.close(fd)
+        archive = Path(name)
+        try:
+            with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_STORED) as bundle:
+                for clip in state.get('clips', []):
+                    path = job_dir(job_id) / f"clip_{int(clip['rank']):02d}.mp4"
+                    bundle.write(path, path.name)
+            return archive
+        except Exception:
+            archive.unlink(missing_ok=True)
+            raise
+    archive = await asyncio.to_thread(make_archive)
+    return FileResponse(archive, filename='reelcrate-clips.zip', media_type='application/zip',
+                        headers={'Cache-Control': 'private, no-store'},
+                        background=BackgroundTask(archive.unlink, missing_ok=True))
+
+
 class RerenderReq(BaseModel):
-    caption: str
+    caption: str = Field(max_length=120)
+    framing: Optional[str] = None
+    show_caption: Optional[bool] = None
     visualizer: Optional[str] = None
-    watermark: Optional[str] = None
+    watermark: Optional[str] = Field(default=None, max_length=40)
     hide_logo: Optional[bool] = None   # paid-tier only — enforced below
 
 
@@ -534,6 +630,12 @@ async def rerender_clip(job_id: str, rank: int, req: RerenderReq,
     if not clip_meta:
         raise HTTPException(404, f"clip {rank} not found")
 
+    if req.visualizer is not None and req.visualizer not in VISUALIZER_STYLES:
+        raise HTTPException(400, 'Unknown visualizer')
+    if req.framing is not None and req.framing not in ('fit', 'crop'):
+        raise HTTPException(400, 'Unknown framing')
+    if req.watermark is not None and any(ord(c) < 32 for c in req.watermark):
+        raise HTTPException(400, 'DJ name must be on one line')
     out_dir = job_dir(job_id)
     clip_src   = out_dir / f"clip_{rank:02d}_src.mp4"   # preserves video+audio
     clip_audio = out_dir / f"clip_{rank:02d}.wav"       # audio-only fallback
@@ -560,7 +662,7 @@ async def rerender_clip(job_id: str, rank: int, req: RerenderReq,
         "end_sec":   duration,
         "peak_sec":  min(duration * 0.2, 6.0),
         "hook":      clip_meta.get("hook", ""),
-        "custom_title": (req.caption or "").strip() or clip_meta.get("hook", ""),
+        "custom_title": req.caption.strip(),
         "tag":       clip_meta.get("tag", "MOMENT"),
         "bpm":       clip_meta.get("bpm") or 0,
         "local_bpm": clip_meta.get("local_bpm") or 0,
@@ -568,13 +670,15 @@ async def rerender_clip(job_id: str, rank: int, req: RerenderReq,
         "local_bpm_confidence": clip_meta.get("local_bpm_confidence") or 0,
     }
 
-    wm = req.watermark or state.get("watermark") or "@realdjez1"
-    viz = req.visualizer or state.get("visualizer") or "freq_bars"
+    wm = req.watermark if req.watermark is not None else clip_meta.get("watermark", state.get("watermark", ""))
+    viz = req.visualizer or clip_meta.get("visualizer", state.get("visualizer", "freq_bars"))
+    framing = req.framing or clip_meta.get("framing", state.get("framing", "crop"))
+    show_caption = req.show_caption if req.show_caption is not None else bool(req.caption.strip())
 
     # Watermark toggle: default to whatever the original job used, override
     # with req.hide_logo if the caller sent one. Then enforce the paid gate —
     # only "active" subscribers can hide the REEL/CRATE logo.
-    hide_logo_req = req.hide_logo if req.hide_logo is not None else bool(state.get("hide_logo"))
+    hide_logo_req = req.hide_logo if req.hide_logo is not None else bool(clip_meta.get("hide_logo", state.get("hide_logo")))
     if hide_logo_req:
         import json as _json
         from auth import USERS_FILE
@@ -593,12 +697,14 @@ async def rerender_clip(job_id: str, rank: int, req: RerenderReq,
         ok = await loop.run_in_executor(
             None,
             lambda: render_clip(source_for_render, local_clip, str(temporary), wm, viz,
-                                hide_logo=hide_logo_req),
+                                hide_logo=hide_logo_req, show_caption=show_caption, framing=framing,
+                                logo_path=str(out_dir / "dj-logo.png") if (out_dir / "dj-logo.png").exists() else None),
         )
         if not ok:
             raise HTTPException(500, 'Re-render failed; your previous clip is still available')
         temporary.replace(out_mp4)
     finally:
+        temporary.unlink(missing_ok=True)
         state['status'] = 'done'
         write_state(job_id, state)
 
@@ -606,6 +712,8 @@ async def rerender_clip(job_id: str, rank: int, req: RerenderReq,
     for c in state.get("clips", []):
         if int(c.get("rank", 0)) == rank:
             c["hook"] = local_clip["custom_title"]
+            c.update(watermark=wm, visualizer=viz, framing=framing,
+                     show_caption=show_caption, hide_logo=hide_logo_req)
     write_state(job_id, state)
 
     # Cache-bust query so the browser refetches the new bytes.

@@ -180,3 +180,128 @@ def test_rerender_preserves_original_on_failure(client,monkeypatch):
 def test_missing_email_key_is_retryable(monkeypatch):
     monkeypatch.setattr(email_service,'RESEND_API_KEY','')
     assert email_service.send_email('test@example.test','test','test') is False
+
+@pytest.mark.parametrize('field,value', [('bpm_min','nan'),('bpm_max','221'),('bpm_min','-5'),('framing','bad'),('watermark','x'*41)])
+def test_bad_clip_settings_rejected(client,monkeypatch,field,value):
+    monkeypatch.setattr(main,'is_paying',lambda email:True)
+    r=client.post('/api/upload',headers=headers(),data={field:value},files={'file':('set.mp4',b'fake')})
+    assert r.status_code==400
+    assert not list(main.JOBS_DIR.iterdir())
+
+@pytest.mark.parametrize('status,expected',[('active',True),('trialing',False)])
+def test_upload_applies_real_controls(client,monkeypatch,status,expected):
+    auth._save_users({'dj@example.test':dict(verified=True,subscription_status=status)})
+    monkeypatch.setattr(main,'is_paying',lambda email:True)
+    received=[]
+    async def capture(*args,**kwargs): received.append((args,kwargs))
+    monkeypatch.setattr(main,'process_job',capture)
+    r=client.post('/api/upload',headers=headers(),data={'show_caption':'false','framing':'crop','watermark':'DJ Test','hide_logo':'true'},files={'file':('set.mp4',b'fake')})
+    assert r.status_code==200
+    st=main.read_state(r.json()['job_id'])
+    assert (st['show_caption'],st['framing'],st['watermark'],st['hide_logo'])==(False,'crop','DJ Test',expected)
+    assert received[0][1]['show_caption'] is False
+    assert received[0][1]['hide_logo'] is expected
+
+
+def test_zip_is_private_and_contains_only_finished_clips(client):
+    import io,zipfile
+    jid=job()
+    (main.job_dir(jid)/'clip_01_src.mp4').write_bytes(b'private source')
+    (main.job_dir(jid)/'users.json').write_text('private')
+    st=client.get('/api/jobs/'+jid,headers=headers()).json()
+    assert client.get('/api/downloads/'+jid).status_code==401
+    assert client.get('/api/downloads/'+jid+'?ticket='+auth.make_token(jid+'/clip_01.mp4',kind='clip')).status_code==401
+    r=client.get(st['download_url'])
+    assert r.status_code==200
+    with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+        assert z.namelist()==['clip_01.mp4']
+        assert z.read('clip_01.mp4')==b'0123456789'
+
+
+def test_rerender_removes_caption_and_name_and_retains_tempo(client,monkeypatch):
+    jid=job(); d=main.job_dir(jid);(d/'clip_01_src.mp4').write_bytes(b'source')
+    st=main.read_state(jid);st.update(watermark='old',framing='fit')
+    st['clips'][0].update(duration_sec=15,local_bpm=123,local_bpm_confidence=.8)
+    main.write_state(jid,st)
+    calls=[]
+    def render(src,clip,path,wm,viz,**kw):
+        calls.append((clip,wm,kw));Path(path).write_bytes(b'updated');return True
+    monkeypatch.setattr(main,'render_clip',render)
+    r=client.post(f'/api/clips/{jid}/1/rerender',headers=headers(),json={'caption':'','watermark':''})
+    assert r.status_code==200
+    clip,wm,kw=calls[0]
+    assert clip['custom_title']==wm==''
+    assert clip['local_bpm_confidence']==.8
+    assert not kw['show_caption'] and kw['framing']=='fit'
+    assert main.read_state(jid)['clips'][0]['show_caption'] is False
+
+
+def test_analysis_grid_stays_aligned_across_chunks(tmp_path):
+    import numpy as np,soundfile as sf
+    from analyze import _stream_rms_and_flux
+    p=tmp_path/'audio.wav'; sr=11025
+    rng=np.random.default_rng(123); sf.write(p,rng.normal(0,.1,sr*5),sr)
+    whole=_stream_rms_and_flux(str(p),chunk_sec=10)
+    chunked=_stream_rms_and_flux(str(p),chunk_sec=.63)
+    for a,b in zip(whole[:2],chunked[:2]):
+        np.testing.assert_allclose(a,b,atol=1e-5)
+
+
+def test_short_set_does_not_duplicate_clips_and_silence_rejected(tmp_path):
+    import numpy as np,soundfile as sf
+    from analyze import detect_drops
+    p=tmp_path/'short.wav';sr=11025;t=np.arange(sr*4)/sr
+    sf.write(p,.3*np.sin(t*2*np.pi*100)*(0.6+0.4*np.sin(t*2*np.pi*2)),sr)
+    clips=detect_drops(str(p),num_clips=10,clip_len_sec=30)
+    assert len(clips)==1 and clips[0]['start_sec']==0 and clips[0]['end_sec']==4
+    sf.write(p,np.zeros(sr*4),sr)
+    with pytest.raises(ValueError,match='no usable audio'):detect_drops(str(p))
+
+@pytest.mark.parametrize('bpm',[60,70,80,95,105,110,120,128,140,174,190])
+def test_known_beat_rates_are_not_quantized_or_octave_shifted(bpm):
+    import numpy as np
+    from analyze import _stable_bpm
+    sr=11025;t=np.arange(sr*20)/sr;y=np.zeros_like(t)
+    for beat in np.arange(0,20,60/bpm):
+        dt=t-beat
+        y+=np.where((dt>=0)&(dt<.12),np.sin(2*np.pi*90*dt)*np.exp(-np.maximum(dt,0)*40),0)
+    actual,confidence=_stable_bpm(y,sr)
+    assert abs(actual-bpm)<.8,(bpm,actual)
+    assert confidence>=.55
+
+
+def test_noise_is_not_confident_and_range_returns_actual_interpretation():
+    import numpy as np
+    from analyze import _stable_bpm,_bpm_for_range
+    _,confidence=_stable_bpm(np.random.default_rng(42).normal(0,.1,11025*20),11025)
+    assert confidence<.55
+    assert _bpm_for_range(70,135,145)==140
+    assert _bpm_for_range(140,60,90)==70
+    assert _bpm_for_range(128,90,110)==0
+
+
+def test_logo_validation_and_sanitized_storage(client,monkeypatch):
+    from PIL import Image
+    import io
+    monkeypatch.setattr(main,'is_paying',lambda email:True)
+    async def noop(*a,**kw):pass
+    monkeypatch.setattr(main,'process_job',noop)
+    logo=io.BytesIO();Image.new('RGBA',(120,80),(255,200,0,100)).save(logo,format='PNG')
+    r=client.post('/api/upload',headers=headers(),files={'file':('set.mp4',b'fake'),'logo':('custom.png',logo.getvalue(),'image/png')})
+    assert r.status_code==200
+    jid=r.json()['job_id'];im=Image.open(main.job_dir(jid)/'dj-logo.png')
+    assert im.mode=='RGBA' and im.size==(120,80)
+    assert main.read_state(jid)['has_custom_logo']
+    main.write_state(jid,{**main.read_state(jid),'status':'done'})
+    r=client.post('/api/upload',headers=headers(),files={'file':('set.mp4',b'fake'),'logo':('bad.png',b'<script>bad</script>','image/png')})
+    assert r.status_code==400
+
+
+def test_caption_wrap_preserves_wide_handles_inside_frame():
+    from render import wrap_caption,FONT_BOLD
+    from PIL import ImageFont
+    text='W'*80+' DJ: 100% [LIVE]'
+    lines=wrap_caption(text,52)
+    assert ''.join(lines).replace(' ','')==text.replace(' ','')
+    font=ImageFont.truetype(FONT_BOLD,52)
+    assert all(font.getlength(line)<=850 for line in lines)

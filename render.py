@@ -4,11 +4,11 @@ Reelcrate clip renderer.
 
 Reads a manifest.json produced by analyze.py and renders each clip into a
 ready-to-post 9:16 1080x1920 MP4 with:
-  - source audio (volume-normalized)
+  - original stereo audio
   - animated waveform strip (yellow)
   - bold caption hook (centered, bottom third)
   - REEL/CRATE watermark (top-left)
-  - @realdjez1 attribution (bottom-right)
+  - optional DJ attribution
   - dark club-style overlay
 
 Usage:
@@ -21,10 +21,14 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
-FONT_BOLD = "/usr/share/fonts/truetype/lato/Lato-Black.ttf"
+FONT_BOLD = next((p for p in [os.environ.get("REELCRATE_FONT", ""),
+    "/usr/share/fonts/truetype/lato/Lato-Black.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"] if Path(p).is_file()), "")
 FONT_TXT = "/usr/share/fonts/truetype/lato/Lato-Heavy.ttf"
 YELLOW = "0xFFE600"
 WHITE = "0xFFFFFF"
@@ -178,7 +182,7 @@ def _visualizer_filter(style: str, w: int, yellow: str) -> tuple[str, int]:
         ht = 240
         f = (
             f"[amain]showwaves=s={w}x{ht}:mode=line:colors={yellow}|0xFFFFFF:rate={FPS}:"
-            f"draw=full:n=80,format=yuva420p,colorchannelmixer=aa=0.85[wave]"
+            f"draw=full:split_channels=1:scale=sqrt,format=yuva420p,colorchannelmixer=aa=0.85[wave]"
         )
         return f, ht
     if style == "cqt_rainbow":
@@ -194,7 +198,7 @@ def _visualizer_filter(style: str, w: int, yellow: str) -> tuple[str, int]:
     ht = 200
     f = (
         f"[amain]showwaves=s={w}x{ht}:mode=line:colors={yellow}:rate={FPS}:"
-        f"draw=full:n=120,format=yuva420p,colorchannelmixer=aa=0.92[wave]"
+        f"draw=full:scale=sqrt,format=yuva420p,colorchannelmixer=aa=0.92[wave]"
     )
     return f, ht
 
@@ -212,16 +216,40 @@ def ff_escape_text(s: str) -> str:
     )
 
 
-def render_clip(source: str, clip: dict, out_path: str, watermark: str,
-                visualizer: str = "freq_bars",
-                hide_logo: bool = False) -> bool:
-    """Render a single 9:16 clip.
+def wrap_caption(text: str, size: int, max_width: int = 850) -> list[str]:
+    """Wrap by rendered width, including long handles and wide capitals."""
+    from PIL import ImageFont
+    font = ImageFont.truetype(FONT_BOLD, size)
+    lines, line = [], ""
+    for word in text.split():
+        if line and font.getlength(line + " " + word) <= max_width:
+            line += " " + word
+            continue
+        if line:
+            lines.append(line)
+        line = ""
+        for character in word:
+            if line and font.getlength(line + character) > max_width:
+                lines.append(line)
+                line = ""
+            line += character
+    if line:
+        lines.append(line)
+    return lines
 
-    hide_logo: when True, skip the REEL/CRATE wordmark in the top-left. This
-    is a paid-tier perk — the caller (main.py) is responsible for verifying
-    the user has an active (not trialing) subscription before passing True.
-    Trial users always get hide_logo=False so the watermark stays visible.
-    """
+
+def render_clip(source: str, clip: dict, out_path: str, watermark: str = "",
+                visualizer: str = "freq_bars", hide_logo: bool = False,
+                show_caption: bool = True, framing: str = "fit",
+                logo_path: str | None = None) -> bool:
+    """Render a phone-compatible clip. Text files keep DJ text out of filter syntax."""
+    with tempfile.TemporaryDirectory(prefix="reelcrate-text-") as text_dir:
+        return _render_clip(source, clip, out_path, watermark, visualizer,
+                            hide_logo, show_caption, framing, Path(text_dir), logo_path)
+
+
+def _render_clip(source, clip, out_path, watermark, visualizer,
+                 hide_logo, show_caption, framing, text_dir, logo_path):
     start = clip["start_sec"]
     end = clip["end_sec"]
     duration = end - start
@@ -240,89 +268,34 @@ def render_clip(source: str, clip: dict, out_path: str, watermark: str,
         style = "freq_bars"
     wave_filter, wave_h = _visualizer_filter(style, W, YELLOW)
 
-    # ---------- text overlays ----------
-    # Use the custom_title if provided (lets the DJ override the auto-generated hook
-    # per clip — wired up from the upload UI later). Otherwise use the hook pool.
-    display_text = custom_title if custom_title else hook
-    safe_hook = ff_escape_text(display_text.upper())
-    safe_tag = ff_escape_text(tag)
-    safe_wm = ff_escape_text(watermark)
-
-    # BPM display only if detector is confident enough — bad room-mic BPMs
-    # were misleading, so we suppress them rather than show a lie.
-    show_bpm = bool(bpm) and bpm_conf >= 0.55
-    bpm_text = ff_escape_text(f"{int(bpm)} BPM") if show_bpm else ""
-
+    # Leave room for the platform's bottom caption and right-side buttons.
+    # Break long words too; captions never silently lose their final words.
+    display_text = str(custom_title if custom_title is not None else hook)
+    display_text = " ".join(display_text.split())[:120]
+    hook_lines = wrap_caption(display_text.upper(), 52) if show_caption else []
+    caption_fs = 52 if len(hook_lines) <= 3 else 42
+    if caption_fs == 42:
+        hook_lines = wrap_caption(display_text.upper(), caption_fs)
+    line_h = caption_fs + 16
+    caption_top_y = H - 370 - line_h * len(hook_lines)
     text_filters = []
 
-    # Logo wordmark (top-left) — free/trial tier keeps this baked in as
-    # marketing exposure. Paid ("active") subscribers can hide it via the
-    # upload UI toggle; main.py enforces the subscription gate before
-    # setting hide_logo=True here.
+    def draw_text(text, size, x, y, extra=""):
+        path = text_dir / f"text_{len(text_filters)}.txt"
+        path.write_text(text, encoding="utf-8")
+        text_filters.append(
+            f"drawtext=fontfile='{FONT_BOLD}':textfile='{path}':expansion=none:"
+            f"fontcolor=white:fontsize={size}:x={x}:y={y}:"
+            f"shadowcolor=black@0.85:shadowx=2:shadowy=2{extra}"
+        )
+
     if not hide_logo:
-        text_filters.append(
-            f"drawtext=fontfile={FONT_BOLD}:text='REEL/CRATE':fontcolor={WHITE}:"
-            f"fontsize=30:x=40:y=44:shadowcolor=black@0.6:shadowx=2:shadowy=2:"
-            f"alpha=0.85"
-        )
-
-    # Tag chip — moved to BOTTOM-LEFT, sitting just above the watermark.
-    # This gets it out of the top-right where lots of DJ set videos have their
-    # own title graphics burned in ("XYZ Watch Party", promoter logos, etc.)
-    # which visually collided with our yellow chip. Bottom-left is empty
-    # airspace and the chip stacks cleanly on top of the @handle watermark.
-    text_filters.append(
-        f"drawtext=fontfile={FONT_BOLD}:text='{safe_tag}':fontcolor=black:"
-        f"fontsize=28:x=40:y=h-130:box=1:boxcolor={YELLOW}:boxborderw=10"
-    )
-
-    # BPM (bottom-right) — small, above the caption area so it doesn't collide
-    if bpm_text:
-        text_filters.append(
-            f"drawtext=fontfile={FONT_BOLD}:text='{bpm_text}':fontcolor={YELLOW}:"
-            f"fontsize=26:x=w-tw-40:y=44:shadowcolor=black@0.6:shadowx=2:shadowy=2"
-        )
-
-    # Watermark (bottom-left) — very bottom, safely below the caption block
-    text_filters.append(
-        f"drawtext=fontfile={FONT_BOLD}:text='{safe_wm}':fontcolor={WHITE}:"
-        f"fontsize=26:x=40:y=h-56:shadowcolor=black@0.6:shadowx=2:shadowy=2:alpha=0.75"
-    )
-
-    # Caption sits at the VERY BOTTOM — matches the app's clip-preview layout.
-    # Wrap long hooks into ~18-char lines.
-    def wrap(text, width=18):
-        words = text.split()
-        lines, cur = [], ""
-        for w in words:
-            if len(cur) + len(w) + 1 <= width:
-                cur = (cur + " " + w).strip()
-            else:
-                if cur:
-                    lines.append(cur)
-                cur = w
-        if cur:
-            lines.append(cur)
-        return lines
-
-    hook_lines = wrap(display_text.upper(), width=18)[:3]
-    # Slightly smaller than before so 3-line captions still fit under the bars.
-    line_h    = 76
-    caption_fs = 62
-    block_h    = line_h * len(hook_lines)
-
-    # Caption block anchored ~120 px from bottom of frame.
-    caption_bottom_margin = 120
-    caption_top_y = H - caption_bottom_margin - block_h
-
-    for i, ln in enumerate(hook_lines):
-        safe_ln = ff_escape_text(ln)
-        text_filters.append(
-            f"drawtext=fontfile={FONT_BOLD}:text='{safe_ln}':fontcolor=white:"
-            f"fontsize={caption_fs}:x=(w-tw)/2:y={caption_top_y + i*line_h}:"
-            f"shadowcolor=black@0.85:shadowx=3:shadowy=3:"
-            f"box=1:boxcolor=black@0.35:boxborderw=14"
-        )
+        draw_text("REEL/CRATE", 28, 70, 110)
+    if watermark.strip():
+        draw_text(watermark.strip()[:40], 28, 70, H - 290)
+    for i, line in enumerate(hook_lines):
+        draw_text(line, caption_fs, "(w-tw)/2-35", caption_top_y + i*line_h,
+                  ":box=1:boxcolor=black@0.45:boxborderw=12")
 
     # ---------- Construct video base ----------
     # Probe for video stream presence AND get the source dimensions so we can
@@ -343,7 +316,7 @@ def render_clip(source: str, clip: dict, out_path: str, watermark: str,
     # and figure out where the crowd/DJ/dancers are. Falls back to center if
     # no faces found or if OpenCV isn't installed.
     face_x_frac = 0.5  # 0..1 horizontal center of interest in source frame
-    if has_video and src_w > 0 and src_h > 0:
+    if has_video and framing == "crop" and src_w > 0 and src_h > 0:
         try:
             face_x_frac = _find_face_center_x(source, start, duration, src_w, src_h)
         except Exception as e:
@@ -354,6 +327,20 @@ def render_clip(source: str, clip: dict, out_path: str, watermark: str,
     audio_split = "[0:a]asplit=2[abg][amain];"
 
     if has_video:
+        audio_split = "[0:a]apad=pad_dur=1[amain];"
+
+    if has_video and framing == "fit":
+        video_chain = (
+            f"{audio_split}"
+            f"[0:v]split=2[blur_src][fit_src];"
+            f"[blur_src]scale=270:480:force_original_aspect_ratio=increase,"
+            f"crop=270:480,gblur=sigma=18,scale={W}:{H},"
+            f"eq=brightness=-0.15[blur];"
+            f"[fit_src]scale={W}:1200:force_original_aspect_ratio=decrease:"
+            f"force_divisible_by=2,setsar=1[fit];"
+            f"[blur][fit]overlay=(W-w)/2:(H-h)/2-170,setsar=1[bg]"
+        )
+    elif has_video:
         # Scale-and-crop the source video to 9:16 centered on face_x_frac.
         #
         # Compute the crop offset as a LITERAL INTEGER in Python rather than
@@ -379,9 +366,9 @@ def render_clip(source: str, clip: dict, out_path: str, watermark: str,
             f"[0:v]scale=w='if(gt(a,{W}/{H}),-2,{W})':h='if(gt(a,{W}/{H}),{H},-2)',"
             f"crop={W}:{H}:{crop_x_px}:(ih-{H})/2,"
             f"setsar=1,"
-            f"eq=brightness=-0.05:saturation=1.1[bg];"
+            f"eq=brightness=-0.05:saturation=1.1[bg]"
             # [abg] is unused in the has_video branch — anullsink drains it.
-            f"[abg]anullsink"
+
         )
     else:
         # No source video — fill the frame with a full-screen CQT visualizer
@@ -399,24 +386,33 @@ def render_clip(source: str, clip: dict, out_path: str, watermark: str,
         )
 
     # Compose: bg → overlay waveform near bottom → drawtext stack
-    text_chain = ",".join(text_filters)
+    text_chain = ",".join(text_filters) or "null"
 
     # Waveform strip sits just ABOVE the caption block, matching the
     # composition in the app preview (bars low, caption underneath).
     wave_gap  = 40
     wave_y    = caption_top_y - wave_h - wave_gap
 
+    logo_filter = ""
+    base_label = "[vbg]"
+    if logo_path:
+        logo_filter = (f"[1:v]scale=280:180:force_original_aspect_ratio=decrease,format=rgba[logo];"
+                       f"[vbg][logo]overlay=x=70:y=190:eof_action=repeat[vlogo];")
+        base_label = "[vlogo]"
     full_filter = (
         f"{video_chain};"
         f"{wave_filter};"
-        f"[bg][wave]overlay=0:{wave_y}[vbg];"
-        f"[vbg]{text_chain}[vout]"
+        f"[bg][wave]overlay=0:{wave_y}:shortest=1[vbg];"
+        f"{logo_filter}{base_label}{text_chain}[vout]"
     )
     inputs = ["-ss", str(start), "-t", str(duration), "-i", source]
+    if logo_path:
+        inputs += ["-i", logo_path]
     map_args = ["-map", "[vout]", "-map", "0:a"]
 
     cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-filter_complex_threads", "2",
         *inputs,
         "-filter_complex", full_filter,
         *map_args,
@@ -430,7 +426,11 @@ def render_clip(source: str, clip: dict, out_path: str, watermark: str,
     ]
 
     print(f"    rendering -> {Path(out_path).name}")
-    res = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=max(180, duration * 20))
+    except subprocess.TimeoutExpired:
+        print("    [ffmpeg error] rendering timed out")
+        return False
     if res.returncode != 0:
         print(f"    [ffmpeg error]\n{res.stderr[-1500:]}")
         return False
@@ -441,7 +441,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("manifest", help="manifest.json from analyze.py")
     ap.add_argument("--source", help="Override source file (default: from manifest)")
-    ap.add_argument("--watermark", default="@realdjez1")
+    ap.add_argument("--watermark", default="")
     ap.add_argument("--visualizer", default="freq_bars",
                     choices=VISUALIZER_STYLES,
                     help=f"Visualizer style for all clips. Options: {', '.join(VISUALIZER_STYLES)}")
