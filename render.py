@@ -103,14 +103,21 @@ def _crop_commands(points, scaled_width, duration, path):
     return int(offsets[0])
 
 
-def _track_shot(samples, frame_width):
+def _track_shot(samples, frame_width, prefer_center=True):
     """Anchor on the clearest foreground face in the shot, then track both ways.
 
     Starting at the first frame is unsafe: a camera may cut while the DJ is
     looking down, leaving only a background face detectable in that frame.
     """
     import numpy as np
-    choices=[(float(f[2]*f[3]),i,f) for i,(_,_,faces) in enumerate(samples) for f in faces]
+    # A nearby spectator at the edge can have a larger face than the DJ.
+    # Prefer a prominent central subject when choosing the shot anchor;
+    # subsequent tracking follows that subject even as they move off-center.
+    largest_area = max((float(f[2]*f[3]) for _,_,faces in samples for f in faces), default=0)
+    choices=[(float(f[2]*f[3]) *
+              (1 if not prefer_center or .15 <= float((f[0]+f[2]/2)/frame_width) <= .85 else .25),i,f)
+             for i,(_,_,faces) in enumerate(samples) for f in faces
+             if float(f[2]*f[3]) >= largest_area * .65]
     if not choices:
         return [(t,None,0.) for t,_,_ in samples]
     _,seed,seed_box=max(choices,key=lambda item:item[0])
@@ -175,8 +182,9 @@ def _face_crop_plan(source, start, duration, src_w, src_h):
                 hist=cv2.calcHist([small],[0,1,2],None,[8,8,8],[0,256]*3)
                 cv2.normalize(hist,hist)
                 cut=previous is not None and (
-                    float(np.mean(cv2.absdiff(small,previous)))>32 and
-                    cv2.compareHist(previous_hist,hist,cv2.HISTCMP_BHATTACHARYYA)>.35)
+                    float(np.mean(cv2.absdiff(small,previous)))>40 or
+                    (float(np.mean(cv2.absdiff(small,previous)))>32 and
+                     cv2.compareHist(previous_hist,hist,cv2.HISTCMP_BHATTACHARYYA)>.35))
                 previous,previous_hist=small,hist
                 if cut:
                     cuts.append(t);shots.append([])
@@ -194,6 +202,14 @@ def _face_crop_plan(source, start, duration, src_w, src_h):
             observations.extend(_track_shot(shot,640))
     coverage=sum(o[1] is not None for o in observations)/max(1,len(observations))
     plan=_crop_track(observations,duration,min(1.,src_h*W/H/src_w),cuts)
+    if plan is None:
+        # Centrality is only a preference: a DJ can legitimately be near an
+        # edge. Try the prominent foreground anchor before abandoning crop.
+        alternate = [o for shot in shots if shot for o in _track_shot(shot,640,False)]
+        alternate_plan = _crop_track(alternate,duration,min(1.,src_h*W/H/src_w),cuts)
+        if alternate_plan is not None:
+            observations,plan = alternate,alternate_plan
+            coverage=sum(o[1] is not None for o in observations)/max(1,len(observations))
     info={"coverage":round(coverage,3),"shots":len(cuts)+1,"samples":len(observations),
           "moving":bool(plan and max(x for _,x in plan)-min(x for _,x in plan)>.01)}
     print(f"    [smart-crop] {'tracked' if plan else 'wide fallback'}: {info}")

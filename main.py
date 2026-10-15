@@ -35,12 +35,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from reliability import start_mail_worker, queue_email, rate_limit
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 from starlette.background import BackgroundTask
 
 # Engine modules live alongside this file (flat layout for simpler deploys).
 sys.path.insert(0, str(Path(__file__).parent))
 from analyze import detect_drops, assign_hooks, GENRE_BPM_RANGES  # type: ignore
+from transitions import detect_transitions
 from render import render_clip, VISUALIZER_STYLES  # type: ignore
 from auth import router as auth_router, current_user  # type: ignore
 from billing import router as billing_router, is_paying, stripe, stripe_error_handler  # type: ignore
@@ -98,7 +99,7 @@ async def lifespan(app):
         stop.set()
         await asyncio.to_thread(worker.join, 12)
 
-app = FastAPI(title="Reelcrate API", version="0.7.6", lifespan=lifespan)
+app = FastAPI(title="Reelcrate API", version="0.8.0", lifespan=lifespan)
 app.add_exception_handler(stripe.error.StripeError, stripe_error_handler)
 
 @app.middleware('http')
@@ -208,7 +209,7 @@ async def process_job(job_id: str, source_path: Path, genre: str,
                       watermark: str, variation_seed: int = 0,
                       bpm_min: float = 0, bpm_max: float = 0,
                       hide_logo: bool = False, show_caption: bool = True,
-                      framing: str = "fit") -> None:
+                      framing: str = "fit", selection_mode: str = "transitions") -> None:
     """Run analyze + render in a worker thread. Updates job state as it goes."""
     out_dir = job_dir(job_id)
     state = read_state(job_id) or {}
@@ -222,7 +223,7 @@ async def process_job(job_id: str, source_path: Path, genre: str,
         loop = asyncio.get_event_loop()
         clips = await loop.run_in_executor(
             None,
-            lambda: detect_drops(str(source_path), num_clips=num_clips,
+            lambda: (detect_transitions if selection_mode == "transitions" else detect_drops)(str(source_path), num_clips=num_clips,
                                  clip_len_sec=clip_length, genre=genre,
                                  variation_seed=variation_seed,
                                  bpm_min=bpm_min, bpm_max=bpm_max),
@@ -234,6 +235,7 @@ async def process_job(job_id: str, source_path: Path, genre: str,
             "num_clips": len(clips),
             "clip_length_sec": clip_length,
             "genre": genre,
+            "selection_mode": selection_mode,
             "visualizer": visualizer,
             "clips": clips,
         }
@@ -328,6 +330,7 @@ async def process_job(job_id: str, source_path: Path, genre: str,
             rendered.append({
                 "rank": c["rank"],
                 "tag": c["tag"],
+                **{key: c[key] for key in ("selection_mode", "transition_start_sec", "transition_end_sec", "transition_evidence", "tempo_before", "tempo_after") if key in c},
                 "hook": c["hook"],
                 "bpm": c.get("bpm"),
                 "local_bpm": c.get("local_bpm"),
@@ -359,7 +362,7 @@ async def process_job(job_id: str, source_path: Path, genre: str,
         if protected:
             warnings.append(f"Kept the full shot in {protected} clips because a reliable close-up could not be maintained.")
         if len(rendered) < num_clips:
-            warnings.append(f"Made {len(rendered)} of {num_clips} requested clips. Try fewer clips or a wider BPM range. A short set or a failed render can also reduce the total.")
+            warnings.append(f"Made {len(rendered)} of {num_clips} requested clips. " + ("Only clear transitions that fit your length and BPM range are included; ordinary peaks were not added. Try 60 seconds or a wider BPM range." if selection_mode == "transitions" else "Try fewer clips or a wider BPM range. A short set or a failed render can also reduce the total."))
         if any(not c.get("genre_match", True) for c in rendered):
             warnings.append("Some clips are outside your BPM range because there were not enough confident matches. Tempo is an estimate.")
         # --- Done ---
@@ -409,6 +412,7 @@ async def upload(
     watermark: str = Form(""),
     show_caption: bool = Form(True),
     framing: str = Form("fit"),
+    selection_mode: str = Form("transitions"),
     variation_seed: int = Form(0),               # 0 = deterministic; >0 = randomize picks
     bpm_min: float = Form(0),                    # explicit BPM range (preferred over genre)
     bpm_max: float = Form(0),
@@ -448,6 +452,10 @@ async def upload(
     if not (10 <= clip_length <= 90):
         raise HTTPException(400, "clip_length out of range (10-90 sec)")
 
+    if selection_mode not in ("transitions", "energy"):
+        raise HTTPException(400, "Choose Music transitions or Energy moments")
+    if selection_mode == "transitions" and clip_length < 30:
+        raise HTTPException(400, "Music transitions need 30 or 60 seconds so both songs have room")
     if framing not in ("fit", "crop"):
         raise HTTPException(400, "Choose Keep full frame or Fill screen")
     if len(watermark) > 40 or any(ord(c) < 32 for c in watermark):
@@ -541,6 +549,7 @@ async def upload(
         "watermark": watermark.strip(),
         "show_caption": show_caption,
         "framing": framing,
+        "selection_mode": selection_mode,
         "has_custom_logo": logo_image is not None,
         "started_at": time.time(),
         "owner_email": user_email,
@@ -555,7 +564,7 @@ async def upload(
         job_id, source_path, genre, visualizer, num_clips, clip_length, watermark,
         variation_seed=variation_seed,
         bpm_min=bpm_min, bpm_max=bpm_max,
-        hide_logo=hide_logo, show_caption=show_caption, framing=framing,
+        hide_logo=hide_logo, show_caption=show_caption, framing=framing, selection_mode=selection_mode,
     ))
 
     return JSONResponse({"job_id": job_id, "status_url": f"/api/jobs/{job_id}"})
@@ -802,10 +811,11 @@ def _require_admin(authorization: Optional[str] = Header(None)) -> None:
 
 
 class WaitlistReq(BaseModel):
-    email: str
-    name: Optional[str] = ""
-    handle: Optional[str] = ""
-    source: Optional[str] = "reelcrate.app"
+    email: EmailStr
+    name: Optional[str] = Field(default="", max_length=120)
+    handle: Optional[str] = Field(default="", max_length=80)
+    source: Optional[str] = Field(default="reelcrate.app", max_length=120)
+    bot_field: str = Field(default="", max_length=500)
 
 
 def _load_waitlist() -> list:
@@ -813,8 +823,8 @@ def _load_waitlist() -> list:
         return []
     try:
         return json.loads(WAITLIST_FILE.read_text())
-    except Exception:
-        return []
+    except Exception as exc:
+        raise RuntimeError('Signup records cannot be read; refusing to overwrite them') from exc
 
 
 def _save_waitlist(entries: list) -> None:
@@ -823,8 +833,93 @@ def _save_waitlist(entries: list) -> None:
         tmp = WAITLIST_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(entries, indent=2))
         tmp.replace(WAITLIST_FILE)
-    except Exception as e:
-        print(f"[waitlist] save failed: {e}")
+    except Exception as exc:
+        raise RuntimeError('Signup records could not be saved') from exc
+
+
+def _signup_roster():
+    """One DJ per normalized email across the form and verified app accounts."""
+    from auth import _load_users
+    people = {}
+    for entry in _load_waitlist():
+        email = (entry.get('email') or '').strip().lower()
+        if not email:
+            continue
+        row = people.setdefault(email, {'email':email, 'name':entry.get('name',''),
+            'joined_at':entry.get('joined_at',0), 'sources':[]})
+        source = entry.get('source') or 'landing page'
+        if source not in row['sources']:
+            row['sources'].append(source)
+        row['joined_at'] = min(row['joined_at'] or entry.get('joined_at',0), entry.get('joined_at',0) or row['joined_at'])
+    for email, user in _load_users().items():
+        if not user.get('verified'):
+            continue
+        email = email.strip().lower()
+        row = people.setdefault(email, {'email':email,'name':user.get('name',''),
+            'joined_at':user.get('created_at',0),'sources':[]})
+        row['sources'].append('verified app account')
+    internal = {ADMIN_EMAIL.strip().lower(), 'support@reelcrate.app', 'hello@reelcrate.app'}
+    for row in people.values():
+        email = row['email']
+        base = email.split('@')[0].split('+')[0] + '@' + email.split('@')[-1]
+        row['counts_as_dj'] = base not in internal and not email.endswith(('.test','.invalid','@example.com'))
+    return sorted(people.values(), key=lambda row:(row['joined_at'], row['email']))
+
+
+def _founder_counts(roster=None):
+    roster = _signup_roster() if roster is None else roster
+    total = sum(row['counts_as_dj'] for row in roster)
+    return {'capacity':40, 'signed_up':total, 'remaining':max(0,40-total)}
+
+
+@app.get('/api/founder-spots')
+async def founder_spots():
+    # Only aggregates are public. Never expose names, addresses or account state.
+    try:
+        return JSONResponse(_founder_counts(), headers={'Cache-Control':'no-store'})
+    except Exception as exc:
+        raise HTTPException(503, 'Signup count is temporarily unavailable') from exc
+
+
+async def _require_owner(email: str = Depends(current_user)):
+    from auth import _load_users
+    if email.strip().lower() != ADMIN_EMAIL.strip().lower() or not _load_users().get(email, {}).get('verified'):
+        raise HTTPException(403, 'Only the Reelcrate owner can open signup records')
+    return email
+
+
+@app.get('/api/admin/signups')
+async def owner_signups(_=Depends(_require_owner)):
+    rows = _signup_roster()
+    return JSONResponse({**_founder_counts(rows), 'entries':rows}, headers={'Cache-Control':'no-store'})
+
+
+class SignupImportEntry(BaseModel):
+    email: EmailStr
+    name: str = Field(default='', max_length=120)
+    joined_at: int = Field(ge=0)
+
+
+class SignupImport(BaseModel):
+    entries: list[SignupImportEntry] = Field(max_length=1000)
+
+
+@app.post('/api/admin/signups/import')
+async def import_signups(req: SignupImport, _=Depends(_require_owner)):
+    entries = _load_waitlist()
+    existing = {(e.get('email') or '').strip().lower():e for e in entries}
+    added = 0
+    for item in req.entries:
+        email = str(item.email).strip().lower()
+        if email in existing:
+            old = existing[email]
+            old['joined_at'] = min(old.get('joined_at') or item.joined_at, item.joined_at)
+            continue
+        entries.append({'email':email,'name':item.name,'joined_at':item.joined_at,'source':'Netlify claimspot import'})
+        existing[email] = entries[-1]
+        added += 1
+    _save_waitlist(entries)
+    return {'ok':True,'imported':added,**_founder_counts()}
 
 
 @app.post("/api/waitlist")
@@ -833,6 +928,8 @@ async def join_waitlist(req: WaitlistReq):
     submitter a welcome email so they know they made it onto the list, and
     fires an alert to the founder inbox."""
     from email_service import send_waitlist_welcome, send_waitlist_alert
+    if req.bot_field:
+        return {'ok':True}
     email = (req.email or "").strip().lower()
     if "@" not in email or "." not in email:
         raise HTTPException(400, "invalid email")
@@ -851,11 +948,15 @@ async def join_waitlist(req: WaitlistReq):
         })
         _save_waitlist(entries)
 
+    roster = _signup_roster()
+    founders = [row['email'] for row in roster if row['counts_as_dj']][:40]
+    founder = email in founders
     if not already:
-        queue_email(send_waitlist_welcome, email, (req.name or '').strip())
+        if founder:
+            queue_email(send_waitlist_welcome, email, (req.name or '').strip())
         queue_email(send_waitlist_alert, ADMIN_EMAIL, email, (req.name or '').strip())
 
-    return {"ok": True, "already_on_list": already, "total": len(entries)}
+    return {"ok": True, "founder":founder, **_founder_counts(roster)}
 
 
 @app.get("/api/admin/waitlist")

@@ -534,3 +534,13 @@ def test_caption_wrap_preserves_wide_handles_inside_frame():
     assert ''.join(lines).replace(' ','')==text.replace(' ','')
     font=ImageFont.truetype(FONT_BOLD,52)
     assert all(font.getlength(line)<=850 for line in lines)
+
+
+def test_shot_anchor_prefers_dj_over_larger_edge_spectator(monkeypatch):
+    import numpy as np,render
+    gray=np.zeros((180,320),dtype=np.uint8)
+    dj=(145,40,30,35);spectator=(285,40,35,40)
+    monkeypatch.setattr(render,'_flow_face_box',lambda previous,current,box:box)
+    samples=[(i*.25,gray,[spectator,dj]) for i in range(8)]
+    path=render._track_shot(samples,320)
+    assert all(abs(x-.5)<.001 for _,x,_ in path)

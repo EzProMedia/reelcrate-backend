@@ -69,3 +69,27 @@ Model: https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yune
 The bundled `face_detection_yunet_2023mar.onnx` is distributed under the MIT
 license included in `YUNET-LICENSE.txt`. SHA-256:
 `8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4`.
+
+## Music transitions and signup count (0.8.0)
+
+Uploads accept `selection_mode=transitions|energy`. Transition mode compares
+sustained harmonic and timbral changes, rejects recurring sections and short
+returns, and retains music on both sides of a candidate handover. It requires
+30 or 60 seconds. This is an estimate, not track fingerprinting: it can miss
+mixes or confuse musical sections. Fewer qualified, nonoverlapping transitions
+produce fewer clips with an explicit warning; energy peaks never pad the pack.
+BPM filters require confident estimates on both sides. An uncertain or changing
+tempo is not shown as one authoritative BPM.
+
+The landing page reads only aggregate counts from `/api/founder-spots`.
+The verified `ADMIN_EMAIL` account can review `/api/admin/signups` and import
+existing Netlify records through the separate frontend `app/signups.html`.
+Imports preserve the earliest signup date and do not send email or create
+accounts. Counts deduplicate normalized emails across the waitlist and verified
+accounts, exclude internal/test addresses, and never show negative remaining
+spots. Contact records remain private on the persistent data volume. This does
+not change Stripe promotion eligibility or coupon redemption limits.
+
+Run `pytest -q test_regressions.py test_transitions_and_signups.py` for isolated
+regression tests. Real-recording QA and private media belong outside this public
+repository.

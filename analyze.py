@@ -680,6 +680,7 @@ def detect_drops(audio_path: str, num_clips: int = 5, clip_len_sec: float = 30.0
 # ---------------- Tagging ----------------
 
 HOOK_POOL = {
+    "TRANSITION": ["in the mix", "one track into the next", "from the decks", "keep the music moving", "a change of groove", "sound on", "next one in", "a moment in the mix", "from this session", "on the decks"],
     "ENERGY": [
         "energy from the booth", "turn this one up", "a moment from the set",
         "in the mix", "from the decks", "keep the music moving",
@@ -703,6 +704,8 @@ def _resolve_tag(c: dict) -> str:
     Spectral flux cannot prove two tracks are blending, a drop is imminent,
     or the crowd reacted. Those claims require separate verified evidence.
     """
+    if c.get("selection_mode") == "transitions" and c.get("transition_evidence"):
+        return "TRANSITION"
     energy = c.get("energy", 0) or 0
     return "ENERGY" if energy > .75 else "MOMENT" if energy > .5 else "VIBE"
 

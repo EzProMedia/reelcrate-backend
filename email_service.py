@@ -144,8 +144,8 @@ def send_waitlist_welcome(to: str, name: str = "") -> bool:
             f'&nbsp;2. Start your 14-day free trial (no card charged for 14 days)<br>'
             f'&nbsp;3. At Stripe checkout, enter <b>FOUNDER40</b> in the promo field<br>'
             f'&nbsp;4. You\'re locked in at $9.50/mo for life<br><br>'
-            f'<b>What Reelcrate does:</b> drop a set (audio or video, up to 4 hrs), pick a BPM range and a visualizer, '
-            f'and we cut it into 5 ready-to-post 9:16 clips with captions baked in — Reels, TikTok, Shorts. About 3 minutes end-to-end.<br><br>'
+            f'<b>What Reelcrate does:</b> upload a set (audio or video, up to 2 GB), choose transitions or energy moments, and pick your look, '
+            f'then preview your 9:16 clips with animated visualizers, optional captions and your own logo. Download and post to Reels, TikTok or Shorts.<br><br>'
             f'<b>Heads up:</b> only 40 founder spots. Once they\'re gone, the code expires and it\'s regular pricing from there.<br><br>'
             f'— DJ EZ1 (founder)')
     return send_email(to, "Your Reelcrate founder code (FOUNDER40) is inside",
@@ -170,7 +170,7 @@ def send_subscription_welcome(to: str, name: str = "", plan_label: str = "",
     parts = [f'Hey {name or "DJ"} —<br><br>',
              (f'Your <b>{plan}</b> free trial is live. '
               f'You have full access to Reelcrate right now — upload sets, '
-              f'pick BPM ranges, get 5 ready-to-post clips in ~3 minutes.<br><br>'
+              f'choose your clip count, length, BPM range, visualizer and custom logo.<br><br>'
               if is_trialing else
               f'Your <b>{plan}</b> subscription is active. Thanks for backing Reelcrate.<br><br>')]
     if is_trialing and next_bill:
@@ -179,7 +179,7 @@ def send_subscription_welcome(to: str, name: str = "", plan_label: str = "",
     parts.append(
         '<b>What to do first:</b><br>'
         '&nbsp;• Sign in at <a href="' + APP_URL + '/app/" style="color:#f5c518">reelcrate.app/app</a><br>'
-        '&nbsp;• Upload your most recent set (video or audio, up to 4 hrs)<br>'
+        '&nbsp;• Upload your most recent set (video or audio, up to 2 GB)<br>'
         '&nbsp;• Pick a BPM range that matches the section you want to clip<br>'
         '&nbsp;• Post the clips to Reels / TikTok / Shorts<br><br>'
         '— DJ EZ1 (founder)'
