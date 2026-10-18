@@ -93,3 +93,12 @@ not change Stripe promotion eligibility or coupon redemption limits.
 Run `pytest -q test_regressions.py test_transitions_and_signups.py` for isolated
 regression tests. Real-recording QA and private media belong outside this public
 repository.
+
+
+## Crowd-facing recordings (0.9.0)
+
+`selection_mode=crowd` measures sustained, distributed visual activity after compensating camera translation, rotation and zoom. It accepts 15/30/60-second UI lengths, keeps context before/after each peak, avoids overlap, applies the existing confidence-based BPM filters, and never pads results with audio peaks. This is visual activity estimation on user-designated audience footage, not semantic cheering, emotion or song recognition. Lighting, low detail, rapid camera movement and animated graphics can affect results.
+
+Optional `crowd_region` is a JSON array `[x,y,width,height]` of normalized coordinates. The phone UI lets the user draw this region on a local video preview, useful for livestreams containing animated posters. Validate finite, in-frame coordinates and a minimum 15% width/height before processing. Use the same region for analysis, output and caption edits. Crowd exports preserve the entire chosen region on a clean black background; face tracking is disabled even if requested through the API. All visual analysis stays within this service. No third-party vision API or new dependency is used.
+
+Run `pytest -q test_regressions.py test_transitions_and_signups.py test_crowd.py`. User footage and generated review clips stay outside the public repository. The existing 2 GB upload limit still applies.

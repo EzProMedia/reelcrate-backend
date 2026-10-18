@@ -544,3 +544,34 @@ def test_shot_anchor_prefers_dj_over_larger_edge_spectator(monkeypatch):
     samples=[(i*.25,gray,[spectator,dj]) for i in range(8)]
     path=render._track_shot(samples,320)
     assert all(abs(x-.5)<.001 for _,x,_ in path)
+
+
+def test_crowd_upload_passes_validated_area_to_worker(client,monkeypatch):
+    auth._save_users({'dj@example.test':dict(verified=True,subscription_status='active')})
+    monkeypatch.setattr(main,'is_paying',lambda email:True)
+    received=[]
+    async def capture(*args,**kwargs): received.append(kwargs)
+    monkeypatch.setattr(main,'process_job',capture)
+    region=[0,.355,.685,.645]
+    r=client.post('/api/upload',headers=headers(),data={'selection_mode':'crowd','clip_length':'15','crowd_region':json.dumps(region)},files={'file':('set.mp4',b'fake')})
+    assert r.status_code==200
+    assert received[0]['selection_mode']=='crowd' and received[0]['crowd_region']==region
+
+
+def test_crowd_invalid_area_rejected_before_upload(client,monkeypatch):
+    monkeypatch.setattr(main,'is_paying',lambda email:True)
+    r=client.post('/api/upload',headers=headers(),data={'selection_mode':'crowd','crowd_region':'[0,0,2,1]'},files={'file':('set.mp4',b'fake')})
+    assert r.status_code==400 and not list(main.JOBS_DIR.iterdir())
+
+
+def test_crowd_rerender_preserves_mode_and_area(client,monkeypatch):
+    jid=job();d=main.job_dir(jid);(d/'clip_01_src.mp4').write_bytes(b'source')
+    state=main.read_state(jid);region=[0,.355,.685,.645]
+    state['clips'][0].update(selection_mode='crowd',crowd_region=region)
+    main.write_state(jid,state);calls=[]
+    def render(src,clip,path,*args,**kwargs):
+        calls.append(clip);Path(path).write_bytes(b'updated');return True
+    monkeypatch.setattr(main,'render_clip',render)
+    r=client.post(f'/api/clips/{jid}/1/rerender',headers=headers(),json={'caption':'dance floor','framing':'crop'})
+    assert r.status_code==200
+    assert calls[0]['selection_mode']=='crowd' and calls[0]['crowd_region']==region

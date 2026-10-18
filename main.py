@@ -42,6 +42,7 @@ from starlette.background import BackgroundTask
 sys.path.insert(0, str(Path(__file__).parent))
 from analyze import detect_drops, assign_hooks, GENRE_BPM_RANGES  # type: ignore
 from transitions import detect_transitions
+from crowd import detect_crowd, validate_region
 from render import render_clip, VISUALIZER_STYLES  # type: ignore
 from auth import router as auth_router, current_user  # type: ignore
 from billing import router as billing_router, is_paying, stripe, stripe_error_handler  # type: ignore
@@ -99,7 +100,7 @@ async def lifespan(app):
         stop.set()
         await asyncio.to_thread(worker.join, 12)
 
-app = FastAPI(title="Reelcrate API", version="0.8.0", lifespan=lifespan)
+app = FastAPI(title="Reelcrate API", version="0.9.0", lifespan=lifespan)
 app.add_exception_handler(stripe.error.StripeError, stripe_error_handler)
 
 @app.middleware('http')
@@ -209,7 +210,7 @@ async def process_job(job_id: str, source_path: Path, genre: str,
                       watermark: str, variation_seed: int = 0,
                       bpm_min: float = 0, bpm_max: float = 0,
                       hide_logo: bool = False, show_caption: bool = True,
-                      framing: str = "fit", selection_mode: str = "transitions") -> None:
+                      framing: str = "fit", selection_mode: str = "transitions", crowd_region=None) -> None:
     """Run analyze + render in a worker thread. Updates job state as it goes."""
     out_dir = job_dir(job_id)
     state = read_state(job_id) or {}
@@ -217,16 +218,17 @@ async def process_job(job_id: str, source_path: Path, genre: str,
     try:
         # --- Step 1: analyze ---
         state.update({"status": "analyzing", "progress": 10,
-                      "message": "Finding the moments…"})
+                      "message": "Scanning audience movement… Longer videos take more time." if selection_mode == "crowd" else "Finding the moments…"})
         write_state(job_id, state)
 
         loop = asyncio.get_event_loop()
         clips = await loop.run_in_executor(
             None,
-            lambda: (detect_transitions if selection_mode == "transitions" else detect_drops)(str(source_path), num_clips=num_clips,
+            lambda: {"transitions": detect_transitions, "crowd": detect_crowd, "energy": detect_drops}[selection_mode](str(source_path), num_clips=num_clips,
                                  clip_len_sec=clip_length, genre=genre,
                                  variation_seed=variation_seed,
-                                 bpm_min=bpm_min, bpm_max=bpm_max),
+                                 bpm_min=bpm_min, bpm_max=bpm_max,
+                                 **({"crowd_region": crowd_region} if selection_mode == "crowd" else {})),
         )
         clips = assign_hooks(clips)
 
@@ -330,7 +332,7 @@ async def process_job(job_id: str, source_path: Path, genre: str,
             rendered.append({
                 "rank": c["rank"],
                 "tag": c["tag"],
-                **{key: c[key] for key in ("selection_mode", "transition_start_sec", "transition_end_sec", "transition_evidence", "tempo_before", "tempo_after") if key in c},
+                **{key: c[key] for key in ("selection_mode", "transition_start_sec", "transition_end_sec", "transition_evidence", "crowd_evidence", "crowd_region", "tempo_before", "tempo_after") if key in c},
                 "hook": c["hook"],
                 "bpm": c.get("bpm"),
                 "local_bpm": c.get("local_bpm"),
@@ -362,7 +364,7 @@ async def process_job(job_id: str, source_path: Path, genre: str,
         if protected:
             warnings.append(f"Kept the full shot in {protected} clips because a reliable close-up could not be maintained.")
         if len(rendered) < num_clips:
-            warnings.append(f"Made {len(rendered)} of {num_clips} requested clips. " + ("Only clear transitions that fit your length and BPM range are included; ordinary peaks were not added. Try 60 seconds or a wider BPM range." if selection_mode == "transitions" else "Try fewer clips or a wider BPM range. A short set or a failed render can also reduce the total."))
+            warnings.append(f"Made {len(rendered)} of {num_clips} requested clips. " + ("Only clear transitions that fit your length and BPM range are included; ordinary peaks were not added. Try 60 seconds or a wider BPM range." if selection_mode == "transitions" else "Only visible crowd activity that fits your length and BPM range is included; music peaks were not added." if selection_mode == "crowd" else "Try fewer clips or a wider BPM range. A short set or a failed render can also reduce the total."))
         if any(not c.get("genre_match", True) for c in rendered):
             warnings.append("Some clips are outside your BPM range because there were not enough confident matches. Tempo is an estimate.")
         # --- Done ---
@@ -413,6 +415,7 @@ async def upload(
     show_caption: bool = Form(True),
     framing: str = Form("fit"),
     selection_mode: str = Form("transitions"),
+    crowd_region: str = Form(""),
     variation_seed: int = Form(0),               # 0 = deterministic; >0 = randomize picks
     bpm_min: float = Form(0),                    # explicit BPM range (preferred over genre)
     bpm_max: float = Form(0),
@@ -452,8 +455,13 @@ async def upload(
     if not (10 <= clip_length <= 90):
         raise HTTPException(400, "clip_length out of range (10-90 sec)")
 
-    if selection_mode not in ("transitions", "energy"):
-        raise HTTPException(400, "Choose Music transitions or Energy moments")
+    if selection_mode not in ("transitions", "energy", "crowd"):
+        raise HTTPException(400, "Choose Music transitions, Crowd reactions or Energy moments")
+    try:
+        parsed_crowd_region = validate_region(json.loads(crowd_region)) if crowd_region else None
+    except (ValueError, TypeError) as e:
+        raise HTTPException(400, str(e))
+    if selection_mode != "crowd": parsed_crowd_region = None
     if selection_mode == "transitions" and clip_length < 30:
         raise HTTPException(400, "Music transitions need 30 or 60 seconds so both songs have room")
     if framing not in ("fit", "crop"):
@@ -564,7 +572,7 @@ async def upload(
         job_id, source_path, genre, visualizer, num_clips, clip_length, watermark,
         variation_seed=variation_seed,
         bpm_min=bpm_min, bpm_max=bpm_max,
-        hide_logo=hide_logo, show_caption=show_caption, framing=framing, selection_mode=selection_mode,
+        hide_logo=hide_logo, show_caption=show_caption, framing=framing, selection_mode=selection_mode, crowd_region=parsed_crowd_region,
     ))
 
     return JSONResponse({"job_id": job_id, "status_url": f"/api/jobs/{job_id}"})
@@ -678,6 +686,8 @@ async def rerender_clip(job_id: str, rank: int, req: RerenderReq,
         "peak_sec":  min(duration * 0.2, 6.0),
         "hook":      clip_meta.get("hook", ""),
         "custom_title": req.caption.strip(),
+        "selection_mode": clip_meta.get("selection_mode"),
+        "crowd_region": clip_meta.get("crowd_region"),
         "tag":       clip_meta.get("tag", "MOMENT"),
         "bpm":       clip_meta.get("bpm") or 0,
         "local_bpm": clip_meta.get("local_bpm") or 0,

@@ -425,6 +425,9 @@ def _render_clip(source, clip, out_path, watermark, visualizer,
     # Follow movement and restart the track when the shot changes.
     crop_plan = None
     face_x_frac = 0.5  # 0..1 horizontal center of interest in source frame
+    if clip.get("selection_mode") == "crowd":
+        framing = "fit"  # Never follow one face out of a crowd, including on re-render.
+
     if has_video and framing == "crop" and src_w > 0 and src_h > 0:
         try:
             crop_plan, tracking = _face_crop_plan(source, start, duration, src_w, src_h)
@@ -445,7 +448,16 @@ def _render_clip(source, clip, out_path, watermark, visualizer,
     if has_video:
         audio_split = "[0:a]apad=pad_dur=1[amain];"
 
-    if has_video and framing == "fit":
+    if has_video and clip.get("selection_mode") == "crowd":
+        from crowd import region_filter
+        crowd_crop = region_filter(clip.get("crowd_region"))
+        region = clip.get("crowd_region") or [0,0,1,1]
+        if show_caption and src_h and src_w * region[2] / (src_h * region[3]) > 1.2:
+            draw_text("FROM THE", 42, 70, 340)
+            draw_text("DANCE FLOOR", 96, 70, 410)
+        video_chain = (f"{audio_split}[0:v]{crowd_crop}scale={W}:{H}:force_original_aspect_ratio=decrease:"
+                       f"force_divisible_by=2,pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[bg]")
+    elif has_video and framing == "fit":
         video_chain = (
             f"{audio_split}"
             f"[0:v]split=2[blur_src][fit_src];"
