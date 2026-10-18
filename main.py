@@ -100,7 +100,7 @@ async def lifespan(app):
         stop.set()
         await asyncio.to_thread(worker.join, 12)
 
-app = FastAPI(title="Reelcrate API", version="0.9.0", lifespan=lifespan)
+app = FastAPI(title="Reelcrate API", version="0.9.1", lifespan=lifespan)
 app.add_exception_handler(stripe.error.StripeError, stripe_error_handler)
 
 @app.middleware('http')
@@ -360,7 +360,7 @@ async def process_job(job_id: str, source_path: Path, genre: str,
         if not rendered:
             raise RuntimeError('No clips could be rendered. Try a different file.')
         warnings = []
-        protected = sum(c.get("framing_requested") == "crop" and c.get("framing") == "fit" for c in rendered)
+        protected = sum(c.get("framing_requested") in ("crop", "reaction") and c.get("framing") == "fit" for c in rendered)
         if protected:
             warnings.append(f"Kept the full shot in {protected} clips because a reliable close-up could not be maintained.")
         if len(rendered) < num_clips:
@@ -464,7 +464,9 @@ async def upload(
     if selection_mode != "crowd": parsed_crowd_region = None
     if selection_mode == "transitions" and clip_length < 30:
         raise HTTPException(400, "Music transitions need 30 or 60 seconds so both songs have room")
-    if framing not in ("fit", "crop"):
+    if framing == "reaction" and selection_mode != "crowd":
+        raise HTTPException(400, "Reaction close-up is available in Crowd reactions mode")
+    if framing not in ("fit", "crop", "reaction"):
         raise HTTPException(400, "Choose Keep full frame or Fill screen")
     if len(watermark) > 40 or any(ord(c) < 32 for c in watermark):
         raise HTTPException(400, "DJ name must be 40 characters or fewer, on one line")
@@ -655,8 +657,10 @@ async def rerender_clip(job_id: str, rank: int, req: RerenderReq,
 
     if req.visualizer is not None and req.visualizer not in VISUALIZER_STYLES:
         raise HTTPException(400, 'Unknown visualizer')
-    if req.framing is not None and req.framing not in ('fit', 'crop'):
+    if req.framing is not None and req.framing not in ('fit', 'crop', 'reaction'):
         raise HTTPException(400, 'Unknown framing')
+    if req.framing == "reaction" and clip_meta.get("selection_mode") != "crowd":
+        raise HTTPException(400, "Reaction close-up is available for crowd clips")
     if req.watermark is not None and any(ord(c) < 32 for c in req.watermark):
         raise HTTPException(400, 'DJ name must be on one line')
     out_dir = job_dir(job_id)

@@ -149,7 +149,7 @@ def _track_shot(samples, frame_width, prefer_center=True):
     return [observations[i] for i in range(len(samples))]
 
 
-def _face_crop_plan(source, start, duration, src_w, src_h):
+def _face_crop_plan(source, start, duration, src_w, src_h, region=None):
     """Check every frame for shot changes; detect and track faces at 4 Hz.
 
     Decode through a temporary small video. Retain only sparse gray frames
@@ -159,12 +159,14 @@ def _face_crop_plan(source, start, duration, src_w, src_h):
         return [(0., .5)], {"coverage": 1., "shots": 1}
     import cv2
     import numpy as np
+    from crowd import region_filter
+    prefix=region_filter(region)
     detector=cv2.FaceDetectorYN.create(str(FACE_MODEL),"",(640,360),.8,.3,1000)
     observations,cuts,shots=[],[],[[]]
     with tempfile.TemporaryDirectory(prefix="reelcrate-track-") as folder:
         sample=str(Path(folder)/"tracking.mp4")
         subprocess.run(["ffmpeg","-nostdin","-v","error","-y","-ss",str(start),
-                        "-t",str(duration),"-i",source,"-an","-vf",f"{TRACK_CLOCK},scale=640:-2,setsar=1",
+                        "-t",str(duration),"-i",source,"-an","-vf",f"{prefix}{TRACK_CLOCK},scale=640:-2,setsar=1",
                         "-c:v","libx264","-preset","ultrafast","-crf","18",sample],
                        check=True,capture_output=True,timeout=max(45,duration*2))
         capture=cv2.VideoCapture(sample)
@@ -425,12 +427,22 @@ def _render_clip(source, clip, out_path, watermark, visualizer,
     # Follow movement and restart the track when the shot changes.
     crop_plan = None
     face_x_frac = 0.5  # 0..1 horizontal center of interest in source frame
-    if clip.get("selection_mode") == "crowd":
-        framing = "fit"  # Never follow one face out of a crowd, including on re-render.
+    crowd = clip.get("selection_mode") == "crowd"
+    crowd_focus = crowd and framing == "reaction"
+    crowd_prefix = ""
+    if crowd:
+        from crowd import region_filter
+        crowd_prefix = region_filter(clip.get("crowd_region"))
+        if crowd_focus:
+            region = clip.get("crowd_region") or [0,0,1,1]
+            src_w = int(src_w * region[2]) // 2 * 2
+            src_h = int(src_h * region[3]) // 2 * 2
+        framing = "crop" if crowd_focus else "fit"
 
     if has_video and framing == "crop" and src_w > 0 and src_h > 0:
         try:
-            crop_plan, tracking = _face_crop_plan(source, start, duration, src_w, src_h)
+            crop_plan, tracking = _face_crop_plan(source, start, duration, src_w, src_h,
+                **({"region": clip.get("crowd_region")} if crowd_focus else {}))
             clip["tracking"] = tracking
             face_x_frac = crop_plan[0][1] if crop_plan else None
         except Exception as e:
@@ -448,11 +460,11 @@ def _render_clip(source, clip, out_path, watermark, visualizer,
     if has_video:
         audio_split = "[0:a]apad=pad_dur=1[amain];"
 
-    if has_video and clip.get("selection_mode") == "crowd":
+    if has_video and crowd and framing == "fit":
         from crowd import region_filter
         crowd_crop = region_filter(clip.get("crowd_region"))
         region = clip.get("crowd_region") or [0,0,1,1]
-        if show_caption and src_h and src_w * region[2] / (src_h * region[3]) > 1.2:
+        if show_caption and src_h and src_w * (1 if crowd_focus else region[2]) / (src_h * (1 if crowd_focus else region[3])) > 1.2:
             draw_text("FROM THE", 42, 70, 340)
             draw_text("DANCE FLOOR", 96, 70, 410)
         video_chain = (f"{audio_split}[0:v]{crowd_crop}scale={W}:{H}:force_original_aspect_ratio=decrease:"
@@ -487,7 +499,7 @@ def _render_clip(source, clip, out_path, watermark, visualizer,
             crop_x_px = 0
         video_chain = (
             f"{audio_split}"
-            f"[0:v]scale=w='if(gt(a,{W}/{H}),-2,{W})':h='if(gt(a,{W}/{H}),{H},-2)',"
+            f"[0:v]{crowd_prefix}scale=w='if(gt(a,{W}/{H}),-2,{W})':h='if(gt(a,{W}/{H}),{H},-2)',"
             f"{motion_filter}crop@follow={W}:{H}:x={crop_x_px}:y=(ih-{H})/2,"
             f"setsar=1,"
             f"eq=brightness=-0.05:saturation=1.1[bg]"

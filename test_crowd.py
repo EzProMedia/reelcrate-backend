@@ -106,3 +106,29 @@ def test_crowd_area_is_used_for_rendering(monkeypatch,tmp_path):
     render.render_clip('test.mp4',clip,str(tmp_path/'clip.mp4'),'DJ','freq_bars')
     command=next(c for c in commands if c[0]=='ffmpeg');graph=command[command.index('-filter_complex')+1]
     assert 'crop=iw*0.685:ih*0.645:iw*0.0:ih*0.355,scale=' in graph
+
+
+def test_reaction_closeup_uses_selected_area_and_falls_back(monkeypatch,tmp_path):
+    import render
+    from types import SimpleNamespace
+    calls=[];tracks=[]
+    def run(cmd,**kw):
+        calls.append(cmd)
+        return SimpleNamespace(stdout='codec_type=video\nwidth=1280\nheight=720\n',returncode=0,stderr='')
+    monkeypatch.setattr(render.subprocess,'run',run)
+    def track(*args,**kw):
+        tracks.append((args,kw));return [(0.,.5),(15.,.6)],{'coverage':1}
+    monkeypatch.setattr(render,'_face_crop_plan',track)
+    clip=assign_hooks(select_reactions(features(),1,15))[0];clip['crowd_region']=[0,.355,.685,.645]
+    render.render_clip('test.mp4',clip,str(tmp_path/'focus.mp4'),'DJ','freq_bars',framing='reaction')
+    graph=next(c[c.index('-filter_complex')+1] for c in calls if c[0]=='ffmpeg')
+    assert clip['framing_applied']=='crop' and 'crop@follow' in graph
+    assert tracks[0][1]['region']==clip['crowd_region']
+    assert tracks[0][0][-2:]==(876,464)
+    assert '[0:v]crop=iw*0.685:ih*0.645:iw*0.0:ih*0.355,scale=' in graph
+    calls.clear()
+    monkeypatch.setattr(render,'_face_crop_plan',lambda *a,**kw:(None,{'coverage':.2}))
+    render.render_clip('test.mp4',clip,str(tmp_path/'wide.mp4'),'DJ','freq_bars',framing='reaction')
+    graph=next(c[c.index('-filter_complex')+1] for c in calls if c[0]=='ffmpeg')
+    assert clip['framing_applied']=='fit' and 'crop@follow' not in graph and 'gblur' not in graph
+    assert '[0:v]crop=' in graph
