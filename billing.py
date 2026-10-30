@@ -30,6 +30,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from reliability import queue_email
+from owner_test_access import owner_test_until
 
 from auth import current_user, _load_users, _save_users
 
@@ -60,6 +61,8 @@ logger = logging.getLogger(__name__)
 def is_paying(email: str) -> bool:
     """The upload gate calls this to decide whether to accept an upload."""
     u = _load_users().get(email) or {}
+    if owner_test_until(u):
+        return True
     if u.get("billing_setup_required"):
         return False
     status = u.get("subscription_status")
@@ -73,6 +76,7 @@ def is_paying(email: str) -> bool:
 
 def _billing_public(u: dict) -> dict:
     return {
+        "owner_test_access_until": owner_test_until(u),
         "subscription_status":              u.get("subscription_status"),
         "subscription_current_period_end":  u.get("subscription_current_period_end"),
         "has_stripe_customer":              bool(u.get("stripe_customer_id")),

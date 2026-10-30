@@ -134,12 +134,15 @@ from reliability import queue_email as _fire_email, rate_limit
 
 # -------------------- user record helpers --------------------
 
+from owner_test_access import owner_test_until
+
 def _public(u: dict) -> dict:
     return {
         "email":    u["email"],
         "name":     u.get("name", u["email"].split("@")[0]),
         "verified": bool(u.get("verified")),
         "mfa_enabled": bool(u.get("mfa_enabled")),
+        "owner_test_access_until": owner_test_until(u),
         "subscription_status": u.get("subscription_status"),
         "subscription_current_period_end": u.get("subscription_current_period_end"),
         "billing_setup_required": bool(u.get("billing_setup_required")),

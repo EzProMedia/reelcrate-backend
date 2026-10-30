@@ -45,6 +45,7 @@ from transitions import detect_transitions
 from crowd import detect_crowd, validate_region
 from render import render_clip, VISUALIZER_STYLES  # type: ignore
 from auth import router as auth_router, current_user  # type: ignore
+from owner_test_access import owner_test_until
 from billing import router as billing_router, is_paying, stripe, stripe_error_handler  # type: ignore
 
 
@@ -440,7 +441,8 @@ async def upload(
     # remove it. We silently coerce rather than 4xx so the frontend can send
     # the flag optimistically and let the backend do the enforcement.
     if hide_logo:
-        _sub_status = (users.get(user_email, {}) or {}).get("subscription_status")
+        _sub_user = users.get(user_email, {}) or {}
+        _sub_status = "active" if owner_test_until(_sub_user) else _sub_user.get("subscription_status")
         if _sub_status != "active":
             hide_logo = False
     # The frontend can send an explicit bpm_min/bpm_max range and any string
@@ -715,7 +717,8 @@ async def rerender_clip(job_id: str, rank: int, req: RerenderReq,
             _users = _json.loads(USERS_FILE.read_text())
         except Exception:
             _users = {}
-        if (_users.get(user_email, {}) or {}).get("subscription_status") != "active":
+        if ((_users.get(user_email, {}) or {}).get("subscription_status") != "active"
+                and not owner_test_until(_users.get(user_email, {}) or {})):
             hide_logo_req = False
 
     loop = asyncio.get_event_loop()
