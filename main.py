@@ -582,6 +582,29 @@ async def upload(
     return JSONResponse({"job_id": job_id, "status_url": f"/api/jobs/{job_id}"})
 
 
+@app.get("/api/latest-job")
+async def latest_job(user_email: str = Depends(current_user)):
+    """Resume this account's newest retained set on any signed-in device."""
+    def find_latest():
+        candidates = []
+        cutoff = time.time() - CLIP_TTL_HOURS * 3600
+        for directory in JOBS_DIR.iterdir():
+            try:
+                if not directory.is_dir():
+                    continue
+                state = read_state(directory.name)
+                if not isinstance(state, dict) or state.get('owner_email') != user_email:
+                    continue
+                if state.get('status') in ('done', 'failed') and directory.stat().st_mtime < cutoff:
+                    continue
+                candidates.append((float(state.get('started_at', directory.stat().st_mtime)), directory.name))
+            except (OSError, ValueError, TypeError, HTTPException):
+                continue
+        return max(candidates)[1] if candidates else None
+    return JSONResponse({'job_id': await asyncio.to_thread(find_latest)},
+                        headers={'Cache-Control': 'private, no-store'})
+
+
 @app.get("/api/jobs/{job_id}")
 async def job_status(job_id: str, user_email: str = Depends(current_user)):
     state = read_state(job_id)
